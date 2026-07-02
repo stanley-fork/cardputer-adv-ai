@@ -164,6 +164,19 @@ keeps the factory app at offset 0x10000, which is where Launcher writes it.
 (`firmware.factory.bin` in the same directory is the full-flash image:
 bootloader + partition table + app, for esptool at offset 0x0.)
 
+**Upgrading from a pre-8M build**: the partition table changed (the unused
+SPIFFS partition was removed to make room for the 8M model) and the flash
+mode changed DIO→QIO. The flash mode lives in the *bootloader* header, which
+Launcher does not rewrite — so for full speed, flash the complete image once
+over USB:
+
+```sh
+pio run -t upload   # or: esptool.py write_flash 0x0 firmware.factory.bin
+```
+
+If boot logs show ~13 MB/s flash bandwidth instead of ~25, the bootloader is
+still DIO.
+
 [pioarduino]: https://github.com/pioarduino/platform-espressif32
 
 ## Host testing (no hardware needed)
@@ -179,15 +192,17 @@ clang++ -std=c++17 -O2 -I tools/host tools/host/host_test.cpp main/llm.cpp -o /t
 
 ## Memory budget (Cardputer ADV, ~280 KB free heap)
 
-| Buffer                              | Bytes    |
-|-------------------------------------|----------|
-| KV cache, ctx=80, int8 + row scales | ~170 KB  |
-| Logits (vocab=12929)                | ~50 KB   |
-| Activations + attention scores      | ~12 KB   |
-| FreeRTOS + matmul worker stack      | 4 KB     |
+| Buffer (8M model, dim=256)           | Bytes    |
+|--------------------------------------|----------|
+| KV cache, ctx=72, int4 + group scales| ~166 KB  |
+| Logits (vocab=12929)                 | ~50 KB   |
+| Activations + attention scores       | ~19 KB   |
+| FreeRTOS + matmul worker stack       | 5 KB     |
 
-The converter enforces `--max-vocab` (default 15,500) so a corpus change
-can't silently blow the logits budget.
+(The 3M model at dim=128 uses an 80-token window and only ~90 KB of KV.)
+The KV window is picked from the model header at boot (`kvLenForModel` in
+`main/main.cpp`). The converter enforces `--max-vocab` (default 15,500) so
+a corpus change can't silently blow the logits budget.
 
 The GPT-Neo KV cache is stored as **int8 with one fp32 scale per row** (the
 LLaMA path keeps bf16) — at dim=128 that's 2 KB/position, which is what makes
@@ -200,6 +215,22 @@ ships 256 position embeddings, so RAM is the binding constraint, not flash.
   GELU MLP, and — faithful to the original — **no 1/sqrt(d) attention
   scaling**. The alternating "local attention" layers have a 256-token
   window ≥ our context, so they degenerate to global causal attention.
+- **ESP32-S3 PIE SIMD matmul** (`main/dot_q4_pie.S`): activations are
+  quantized to int8 once per matmul (llama.cpp's Q4_0×Q8_0 scheme), then
+  each 32-weight block is 2× `EE.VMULAS.S8.ACCX` — 16 int8 MACs per
+  instruction. The CRDP v3 blob stores weights row-planar
+  ([bf16 scales | pad | 16-byte nibble groups]) so every vector load is
+  16-byte aligned. A boot-time selftest compares the SIMD kernel against
+  the scalar reference on real weight rows and refuses to run on mismatch.
+  Host builds (and `-DLLM_FORCE_SCALAR`) use the scalar path.
+- **KV cache is int4** (nibbles + one bf16 scale per 32-element group,
+  Q4_0-style asymmetric). Each head lies inside one scale group, so
+  attention applies a single scale per (head, position). Measured on the
+  eval battery this matches int8-KV quality — and it's what fits the 8M
+  model's 72-token window in SRAM.
+- Weights stream from MMU-mapped flash every token, so **flash bandwidth is
+  the throughput ceiling** for the 8M model — the build uses QIO + 64-byte
+  cache lines, and boot logs the measured flash bandwidth over serial.
 - Tokenizer is **exact** GPT-2 byte-level BPE: the blob embeds the merge
   pair table (binary-searched from flash); verified 0 mismatches vs
   HuggingFace on 500 dataset lines.
@@ -217,14 +248,28 @@ ships 256 position embeddings, so RAM is the binding constraint, not flash.
   turns silently fall out of the prompt.
 - Only kindergarten facts. Everything else gets a (trained) "I don't know" —
   for real factual Q&A you'd need Wi-Fi + an API, or different hardware.
-- ~7 tok/s measured on device. ESP32-S3 PIE SIMD for the Q4 dot product
-  would roughly double it but isn't implemented.
-- Chat quality is bounded by 3M params. The SODA window filter now yields
-  85% (was 47% with the prefix filter); the next lever is the 8M model +
-  PIE SIMD to keep it fast.
+- ~5 tok/s measured on device for the 8M model (196 ms/token; PIE SIMD +
+  QIO + 64-byte cache lines). The ceiling is flash streaming (~30 MB/s,
+  ~5.6 MB read per token); the next levers are a harder vocab prune, 120 MHz
+  flash (experimental HPM), or batched/speculative decoding.
+- Chat quality is bounded by 8M params — noticeably better grammar and
+  context-tracking than 3M, still no real-world knowledge.
 
 ## Changelog
 
+- **v2.0** — the **TinyTalk 2** release
+  ([TinyTalk 1 on HuggingFace](https://huggingface.co/TheREZOR/TinyTalk))
+  - **8M model** (dim=256): same chat fine-tune recipe on
+    TinyStories-Instruct-8M — noticeably better language quality than 3M
+    (frozen-val loss 1.49 vs 1.80). **~5 tok/s measured on device**
+    (196 ms/token), with boot-time serial benchmarks for flash bandwidth
+    and ms/token.
+  - **ESP32-S3 PIE SIMD** Q4×Q8 matmul kernel + QIO flash + 64-byte cache
+    lines to keep it fast; CRDP v3 row-planar blob format (16B-aligned).
+  - **int4 KV cache** (group-32 bf16 scales) — halves KV memory; the 8M
+    model runs a 72-token window, the 3M keeps 80.
+  - Stale v2 `model_data.cpp` blobs are rejected at boot instead of
+    producing gibberish; SIMD kernel self-tests against the scalar path.
 - **v1.2**
   - Smarter model, same speed: retrained on a ~2x larger corpus — SODA
     window filtering (85% yield vs 47%) with TinyStories speaker renaming,

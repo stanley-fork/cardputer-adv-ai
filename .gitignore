@@ -9,3 +9,4 @@ sdkconfig.*
 .claude/
 *.swp
 *.swo
+.cache

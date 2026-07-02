@@ -17,13 +17,31 @@
 // ============================================================================
 static const uint8_t  MAGIC[4]      = { 'C', 'R', 'D', 'P' };
 static const uint32_t VERSION_LLAMA  = 1;   // TinyLLama-v0 (RMSNorm/RoPE/SwiGLU)
-static const uint32_t VERSION_GPTNEO = 2;   // TinyStories-Instruct (LN/wpe/GELU)
+static const uint32_t VERSION_NEO_V2 = 2;   // old interleaved Q4 (rejected: stale)
+static const uint32_t VERSION_NEO_V3 = 3;   // TinyStories (LN/wpe/GELU), row-planar Q4
 static const uint32_t TOK_MAGIC      = 0x324B5443; // "CTK2"
 static const int      BLOCK_SIZE    = 32;   // weights per Q4_0 block
-static const size_t   BYTES_PER_BLK = 18;   // 2B bf16 scale + 16B nibbles
+static const size_t   BYTES_PER_BLK = 18;   // v1: 2B bf16 scale + 16B nibbles
+
+// v3 row-planar layout: each matrix row of n cols (nb = n/32 blocks) is
+//   [nb x u16 bf16 scales][pad to 16B][nb x 16 nibble bytes]
+// so every 16-byte nibble group is 16B-aligned for PIE 128-bit loads.
+// Nibble packing inside a block is the same as v1: byte k = q[k] | q[k+16]<<4.
+static inline size_t v3_row_stride(int n) {
+  size_t nb = (size_t)(n >> 5);
+  size_t sb = 2 * nb;
+  return sb + ((0 - sb) & 15) + 16 * nb;
+}
+static inline size_t v3_nib_off(int n) {
+  size_t sb = 2 * (size_t)(n >> 5);
+  return sb + ((0 - sb) & 15);
+}
 
 static void* ram_alloc(size_t n) {
   return heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+static void* ram_alloc16(size_t n) {
+  return heap_caps_aligned_alloc(16, n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
 
 // ============================================================================
@@ -90,6 +108,83 @@ static inline void dequant_q4_row(float* out, const uint8_t* w, int n) {
   }
 }
 
+// ESP32-S3 PIE SIMD kernel (main/dot_q4_pie.S). The host build and
+// LLM_FORCE_SCALAR builds use the scalar dot_q4q8_v3 below, which mirrors
+// the kernel's accumulation order (exact integer block sums, one float
+// madd per block) so the two agree to float rounding.
+#if defined(__XTENSA__) && !defined(LLM_FORCE_SCALAR)
+#define LLM_USE_PIE 1
+extern "C" float dot_q4q8_pie(const uint8_t* nib, const int8_t* xq,
+                              const uint8_t* scales, const float* xs, int nb);
+#endif
+
+// ============================================================================
+//  v3 kernels: Q8_0 activations x Q4_0 row-planar weights.
+//
+//  Activations are quantized once per matmul call (symmetric int8 per
+//  32-element block, one fp32 scale each) — llama.cpp's Q4_0xQ8_0 scheme.
+//  The dot product is then pure int8 MACs per block, which is exactly what
+//  the ESP32-S3 PIE kernel computes 16 lanes at a time; this scalar version
+//  mirrors its accumulation order (int block sum -> one float madd) so the
+//  two can be compared nearly bit-for-bit.
+// ============================================================================
+static void quantize_row_q8(const float* x, int8_t* xq, float* xs, int n) {
+  int blocks = n >> 5;
+  for (int b = 0; b < blocks; b++) {
+    float mx = 0.0f;
+    for (int i = 0; i < BLOCK_SIZE; i++) {
+      float a = fabsf(x[i]);
+      if (a > mx) mx = a;
+    }
+    float s   = mx / 127.0f;
+    float inv = s > 0 ? 1.0f / s : 0.0f;
+    xs[b] = s;
+    for (int i = 0; i < BLOCK_SIZE; i++) xq[i] = (int8_t)lrintf(x[i] * inv);
+    x  += BLOCK_SIZE;
+    xq += BLOCK_SIZE;
+  }
+}
+
+static inline float dot_q4q8_v3(const uint8_t* wrow, const int8_t* xq,
+                                const float* xs, int n) {
+  int nb = n >> 5;
+  const uint8_t* scales = wrow;
+  const uint8_t* nib    = wrow + v3_nib_off(n);
+  float acc = 0.0f;
+  for (int b = 0; b < nb; b++) {
+    const int8_t* x0 = xq;
+    const int8_t* x1 = xq + 16;
+    int isum = 0;
+    for (int k = 0; k < 16; k++) {
+      uint8_t bk = nib[k];
+      isum += ((int)(bk & 0x0F) - 8) * (int)x0[k];
+      isum += ((int)(bk >> 4)   - 8) * (int)x1[k];
+    }
+    uint16_t sb; memcpy(&sb, scales + 2 * b, 2);
+    acc += bf16_to_fp32(sb) * xs[b] * (float)isum;
+    nib += 16;
+    xq  += BLOCK_SIZE;
+  }
+  return acc;
+}
+
+static inline void dequant_q4_row_v3(float* out, const uint8_t* wrow, int n) {
+  int nb = n >> 5;
+  const uint8_t* scales = wrow;
+  const uint8_t* nib    = wrow + v3_nib_off(n);
+  for (int b = 0; b < nb; b++) {
+    uint16_t sb; memcpy(&sb, scales + 2 * b, 2);
+    float scale = bf16_to_fp32(sb);
+    for (int k = 0; k < 16; k++) {
+      uint8_t bk = nib[k];
+      out[k]      = scale * (float)((int)(bk & 0x0F) - 8);
+      out[k + 16] = scale * (float)((int)(bk >> 4)   - 8);
+    }
+    out += BLOCK_SIZE;
+    nib += 16;
+  }
+}
+
 // ============================================================================
 //  Dual-core Q4 matmul. Same persistent-worker design as before: one task is
 //  pinned to the opposite core for the life of the program; per-call cost is
@@ -97,7 +192,9 @@ static inline void dequant_q4_row(float* out, const uint8_t* w, int n) {
 // ============================================================================
 struct MatmulArgs {
   float* xout;
-  const float* x;
+  const float* x;      // v1: fp32 activations
+  const int8_t* xq;    // v3: quantized activations (NULL for v1)
+  const float* xs;     // v3: per-block activation scales
   const uint8_t* w;
   int n;           // inner dim (multiple of 32)
   size_t row_bytes;
@@ -108,8 +205,23 @@ struct MatmulArgs {
 static void matmul_rows(const MatmulArgs* a) {
   const int n = a->n;
   const size_t rb = a->row_bytes;
-  for (int row = a->row_start; row < a->row_end; row++) {
-    a->xout[row] = dot_q4_f32(a->w + row * rb, a->x, n);
+  if (a->xq) {
+#ifdef LLM_USE_PIE
+    const size_t nib_off = v3_nib_off(n);
+    const int nb = n >> 5;
+    for (int row = a->row_start; row < a->row_end; row++) {
+      const uint8_t* wrow = a->w + row * rb;
+      a->xout[row] = dot_q4q8_pie(wrow + nib_off, a->xq, wrow, a->xs, nb);
+    }
+#else
+    for (int row = a->row_start; row < a->row_end; row++) {
+      a->xout[row] = dot_q4q8_v3(a->w + row * rb, a->xq, a->xs, n);
+    }
+#endif
+  } else {
+    for (int row = a->row_start; row < a->row_end; row++) {
+      a->xout[row] = dot_q4_f32(a->w + row * rb, a->x, n);
+    }
   }
 }
 
@@ -131,21 +243,35 @@ static void ensure_worker() {
   mm_done = xSemaphoreCreateBinary();
   BaseType_t main_core  = xPortGetCoreID();
   BaseType_t other_core = (main_core == 0) ? 1 : 0;
-  xTaskCreatePinnedToCore(mm_worker, "mm_w", 3072, NULL, 5,
+  xTaskCreatePinnedToCore(mm_worker, "mm_w", 4096, NULL, 5,
                           &mm_task_handle, other_core);
 }
 
+// v3 activation-quantization scratch, sized at init for max(dim, hidden_dim).
+// One model per process; both cores read these after the pre-dispatch quant.
+static int8_t* g_xq  = NULL;
+static float*  g_xs  = NULL;
+static int     g_fmt = 0;   // model format version (1 = LLaMA, 3 = GPT-Neo v3)
+
 static void matmul_q4(float* xout, const float* x, const uint8_t* w, int n, int d) {
   ensure_worker();
-  size_t row_bytes = ((size_t)(n / BLOCK_SIZE)) * BYTES_PER_BLK;
+  const bool v3 = (g_fmt == VERSION_NEO_V3);
+  size_t row_bytes = v3 ? v3_row_stride(n)
+                        : ((size_t)(n / BLOCK_SIZE)) * BYTES_PER_BLK;
+  const int8_t* xq = NULL;
+  const float*  xs = NULL;
+  if (v3) {
+    quantize_row_q8(x, g_xq, g_xs, n);   // once per call, before dispatch
+    xq = g_xq; xs = g_xs;
+  }
   int split = d / 2;
 
-  mm_args.xout = xout; mm_args.x = x; mm_args.w = w;
-  mm_args.n = n; mm_args.row_bytes = row_bytes;
+  mm_args.xout = xout; mm_args.x = x; mm_args.xq = xq; mm_args.xs = xs;
+  mm_args.w = w; mm_args.n = n; mm_args.row_bytes = row_bytes;
   mm_args.row_start = 0; mm_args.row_end = split;
   xSemaphoreGive(mm_go);
 
-  MatmulArgs self = { xout, x, w, n, row_bytes, split, d };
+  MatmulArgs self = { xout, x, xq, xs, w, n, row_bytes, split, d };
   matmul_rows(&self);
 
   xSemaphoreTake(mm_done, portMAX_DELAY);
@@ -312,8 +438,7 @@ static float* forward_gptneo(Transformer* T, int token, int pos) {
 
   // ---- token embedding + position embedding ----
   {
-    size_t row_bytes = ((size_t)(dim / BLOCK_SIZE)) * BYTES_PER_BLK;
-    dequant_q4_row(s->x, T->token_embed_q4 + (size_t)token * row_bytes, dim);
+    dequant_q4_row_v3(s->x, T->token_embed_q4 + (size_t)token * v3_row_stride(dim), dim);
     const float* pe = T->wpe + (size_t)pos * dim;
     for (int i = 0; i < dim; i++) s->x[i] += pe[i];
   }
@@ -325,43 +450,70 @@ static float* forward_gptneo(Transformer* T, int token, int pos) {
     matmul_q4(s->k, s->xb, T->wk_q4 + (size_t)l * T->stride_wk, dim, dim);
     matmul_q4(s->v, s->xb, T->wv_q4 + (size_t)l * T->stride_wv, dim, dim);
 
-    // Quantize this position's k/v rows to int8 with one fp32 scale per row.
+    // Quantize this position's k/v rows to int4 nibbles with one bf16 scale
+    // per 32-element group. Quantization uses the bf16-rounded scale so the
+    // decode side sees exactly the value the encode side divided by.
+    const int n_groups = kv_dim / 32;
     {
-      int8_t* krow = s->key_cache8   + (size_t)l * kvL * kv_dim + (size_t)pos * kv_dim;
-      int8_t* vrow = s->value_cache8 + (size_t)l * kvL * kv_dim + (size_t)pos * kv_dim;
-      float kmax = 0, vmax = 0;
-      for (int i = 0; i < kv_dim; i++) {
-        float ka = fabsf(s->k[i]); if (ka > kmax) kmax = ka;
-        float va = fabsf(s->v[i]); if (va > vmax) vmax = va;
-      }
-      float ks = kmax / 127.0f, vs = vmax / 127.0f;
-      float kinv = ks > 0 ? 1.0f / ks : 0, vinv = vs > 0 ? 1.0f / vs : 0;
-      s->k_scales[l * kvL + pos] = ks;
-      s->v_scales[l * kvL + pos] = vs;
-      for (int i = 0; i < kv_dim; i++) {
-        krow[i] = (int8_t)lrintf(s->k[i] * kinv);
-        vrow[i] = (int8_t)lrintf(s->v[i] * vinv);
+      uint8_t*  krow = s->key_cache4   + ((size_t)l * kvL + pos) * (kv_dim / 2);
+      uint8_t*  vrow = s->value_cache4 + ((size_t)l * kvL + pos) * (kv_dim / 2);
+      uint16_t* kgs  = s->k_gscales    + ((size_t)l * kvL + pos) * n_groups;
+      uint16_t* vgs  = s->v_gscales    + ((size_t)l * kvL + pos) * n_groups;
+      for (int g = 0; g < n_groups; g++) {
+        const float* kg = s->k + g * 32;
+        const float* vg = s->v + g * 32;
+        // Q4_0-style asymmetric scale (d = signed-max / -8) uses all 16
+        // levels; quantization uses the bf16-rounded d that decode will see.
+        float kmax = 0, kd = 0, vmax = 0, vd = 0;
+        for (int i = 0; i < 32; i++) {
+          float ka = fabsf(kg[i]); if (ka > kmax) { kmax = ka; kd = kg[i]; }
+          float va = fabsf(vg[i]); if (va > vmax) { vmax = va; vd = vg[i]; }
+        }
+        uint16_t ksb = fp32_to_bf16(kd / -8.0f);
+        uint16_t vsb = fp32_to_bf16(vd / -8.0f);
+        kgs[g] = ksb; vgs[g] = vsb;
+        float ks = bf16_to_fp32(ksb), vs = bf16_to_fp32(vsb);
+        float kinv = ks != 0 ? 1.0f / ks : 0, vinv = vs != 0 ? 1.0f / vs : 0;
+        uint8_t* kb = krow + g * 16;
+        uint8_t* vb = vrow + g * 16;
+        for (int i = 0; i < 32; i += 2) {
+          int k0 = (int)lrintf(kg[i]     * kinv); if (k0 >  7) k0 =  7; if (k0 < -8) k0 = -8;
+          int k1 = (int)lrintf(kg[i + 1] * kinv); if (k1 >  7) k1 =  7; if (k1 < -8) k1 = -8;
+          int v0 = (int)lrintf(vg[i]     * vinv); if (v0 >  7) v0 =  7; if (v0 < -8) v0 = -8;
+          int v1 = (int)lrintf(vg[i + 1] * vinv); if (v1 >  7) v1 =  7; if (v1 < -8) v1 = -8;
+          kb[i / 2] = (uint8_t)((k0 + 8) | ((k1 + 8) << 4));
+          vb[i / 2] = (uint8_t)((v0 + 8) | ((v1 + 8) << 4));
+        }
       }
     }
 
     for (int h = 0; h < p->n_heads; h++) {
       float* q   = s->q   + h * head_size;
       float* att = s->att + h * kvL;
+      const int g   = (h * head_size) / 32;      // this head's scale group
+      const int nib = (h * head_size) / 2;       // byte offset of this head
       for (int t = 0; t <= pos; t++) {
-        const int8_t* k = s->key_cache8 + (size_t)l * kvL * kv_dim
-                                        + (size_t)t * kv_dim + h * head_size;
+        const uint8_t* k = s->key_cache4 + ((size_t)l * kvL + t) * (kv_dim / 2) + nib;
         float score = 0;
-        for (int i = 0; i < head_size; i++) score += q[i] * (float)k[i];
-        att[t] = score * s->k_scales[l * kvL + t];  // note: no 1/sqrt(head_size)
+        for (int i = 0; i < head_size; i += 2) {
+          uint8_t b = k[i / 2];
+          score += q[i]     * (float)((int)(b & 0x0F) - 8);
+          score += q[i + 1] * (float)((int)(b >> 4)   - 8);
+        }
+        // note: no 1/sqrt(head_size) — GPT-Neo doesn't scale attention
+        att[t] = score * bf16_to_fp32(s->k_gscales[((size_t)l * kvL + t) * n_groups + g]);
       }
       softmax(att, pos + 1);
       float* xb = s->xb + h * head_size;
       memset(xb, 0, head_size * sizeof(float));
       for (int t = 0; t <= pos; t++) {
-        const int8_t* v = s->value_cache8 + (size_t)l * kvL * kv_dim
-                                          + (size_t)t * kv_dim + h * head_size;
-        float a = att[t] * s->v_scales[l * kvL + t];
-        for (int i = 0; i < head_size; i++) xb[i] += a * (float)v[i];
+        const uint8_t* v = s->value_cache4 + ((size_t)l * kvL + t) * (kv_dim / 2) + nib;
+        float a = att[t] * bf16_to_fp32(s->v_gscales[((size_t)l * kvL + t) * n_groups + g]);
+        for (int i = 0; i < head_size; i += 2) {
+          uint8_t b = v[i / 2];
+          xb[i]     += a * (float)((int)(b & 0x0F) - 8);
+          xb[i + 1] += a * (float)((int)(b >> 4)   - 8);
+        }
       }
     }
 
@@ -410,7 +562,10 @@ bool llm_init_embedded(Transformer* T, const uint8_t* model_bytes, size_t model_
 
   uint32_t version;
   memcpy(&version, model_bytes + 4, 4);
-  if (version != VERSION_LLAMA && version != VERSION_GPTNEO) return false;
+  // v2 (interleaved Q4) is deliberately rejected: a stale generated
+  // model_data.cpp must fail loudly at boot, not produce gibberish.
+  if (version != VERSION_LLAMA && version != VERSION_NEO_V3) return false;
+  g_fmt = (int)version;
 
   int hdr[7];
   memcpy(hdr, model_bytes + 8, sizeof(hdr));
@@ -425,7 +580,7 @@ bool llm_init_embedded(Transformer* T, const uint8_t* model_bytes, size_t model_
   uint8_t quant  = model_bytes[37];
   T->config.shared_classifier = shared;
   T->config.quant_type        = quant;
-  T->config.arch = (version == VERSION_GPTNEO) ? model_bytes[38] : ARCH_LLAMA;
+  T->config.arch = (version == VERSION_NEO_V3) ? model_bytes[38] : ARCH_LLAMA;
   if (quant != 4) return false;
   if (T->config.arch != ARCH_LLAMA && T->config.arch != ARCH_GPTNEO) return false;
 
@@ -441,20 +596,31 @@ bool llm_init_embedded(Transformer* T, const uint8_t* model_bytes, size_t model_
   };
   size_t off = 64;
 
-  T->stride_wq    = q4_bytes((size_t)(p->n_heads    * head_size) * p->dim);
-  T->stride_wk    = q4_bytes((size_t)kv_dim * p->dim);
-  T->stride_wv    = q4_bytes((size_t)kv_dim * p->dim);
-  T->stride_wo    = q4_bytes((size_t)p->dim * (p->n_heads * head_size));
-  T->stride_w1w3  = q4_bytes((size_t)p->hidden_dim * p->dim);
-  T->stride_w2    = q4_bytes((size_t)p->dim * p->hidden_dim);
+  if (p->arch == ARCH_GPTNEO) {
+    // v3: per-layer stride = rows x row-planar row stride (cols).
+    T->stride_wq    = (size_t)p->dim        * v3_row_stride(p->dim);
+    T->stride_wk    = T->stride_wq;
+    T->stride_wv    = T->stride_wq;
+    T->stride_wo    = T->stride_wq;
+    T->stride_w1w3  = (size_t)p->hidden_dim * v3_row_stride(p->dim);
+    T->stride_w2    = (size_t)p->dim        * v3_row_stride(p->hidden_dim);
+  } else {
+    T->stride_wq    = q4_bytes((size_t)(p->n_heads    * head_size) * p->dim);
+    T->stride_wk    = q4_bytes((size_t)kv_dim * p->dim);
+    T->stride_wv    = q4_bytes((size_t)kv_dim * p->dim);
+    T->stride_wo    = q4_bytes((size_t)p->dim * (p->n_heads * head_size));
+    T->stride_w1w3  = q4_bytes((size_t)p->hidden_dim * p->dim);
+    T->stride_w2    = q4_bytes((size_t)p->dim * p->hidden_dim);
+  }
 
   if (p->arch == ARCH_GPTNEO) {
-    // v2 layout after the 64-byte header (matches convert_tinystories_instruct.py):
+    // v3 layout after the 64-byte header (matches convert_tinystories_instruct.py):
     //   fp32 ln1_g, ln1_b [L*dim]; ln2_g, ln2_b [L*dim]; lnf_g, lnf_b [dim]
     //   fp32 out_proj bias [L*dim]; c_fc bias [L*hidden]; c_proj bias [L*dim]
     //   fp32 wpe [seq_len*dim]
-    //   Q4_0 wte [V*dim] (tied classifier)
-    //   Q4_0 wq, wk, wv, wo, w_fc, w_proj  (per-layer)
+    //   (pad to 16B)
+    //   Q4_0 v3 wte [V rows of dim] (tied classifier)
+    //   Q4_0 v3 wq, wk, wv, wo, w_fc, w_proj  (per-layer)
     size_t Ld = (size_t)p->n_layers * p->dim;
     T->rms_att    = (const float*)(model_bytes + off); off += Ld * sizeof(float);
     T->ln_att_b   = (const float*)(model_bytes + off); off += Ld * sizeof(float);
@@ -467,8 +633,9 @@ bool llm_init_embedded(Transformer* T, const uint8_t* model_bytes, size_t model_
     T->b_proj     = (const float*)(model_bytes + off); off += Ld * sizeof(float);
     T->wpe        = (const float*)(model_bytes + off); off += (size_t)p->seq_len * p->dim * sizeof(float);
 
+    off += (0 - off) & 15;   // Q4 sections start 16B-aligned
     T->token_embed_q4 = model_bytes + off;
-    off += q4_bytes((size_t)p->vocab_size * p->dim);
+    off += (size_t)p->vocab_size * v3_row_stride(p->dim);
     T->wq_q4 = model_bytes + off; off += T->stride_wq * p->n_layers;
     T->wk_q4 = model_bytes + off; off += T->stride_wk * p->n_layers;
     T->wv_q4 = model_bytes + off; off += T->stride_wv * p->n_layers;
@@ -477,6 +644,9 @@ bool llm_init_embedded(Transformer* T, const uint8_t* model_bytes, size_t model_
     T->w2_q4 = model_bytes + off; off += T->stride_w2 * p->n_layers;
     T->w3_q4   = NULL;
     T->wcls_q4 = T->token_embed_q4;
+    // PIE loads fault on unaligned addresses; catch a bad blob at boot.
+    if (((uintptr_t)T->token_embed_q4 & 15) || ((uintptr_t)T->wq_q4 & 15) ||
+        ((uintptr_t)T->w1_q4 & 15) || ((uintptr_t)T->w2_q4 & 15)) return false;
   } else {
     // v1 layout after the 64-byte header:
     //   fp32 rms_att [L*dim]
@@ -522,23 +692,50 @@ bool llm_init_embedded(Transformer* T, const uint8_t* model_bytes, size_t model_
   s->att    = (float*) ram_alloc(p->n_heads * T->kv_seq_len * sizeof(float));
   s->logits = (float*) ram_alloc(p->vocab_size * sizeof(float));
 
+  if (g_fmt == (int)VERSION_NEO_V3) {
+    // Activation-quantization scratch shared by both matmul cores. 16B-aligned
+    // so the PIE kernel can vector-load it.
+    int max_n = p->dim > p->hidden_dim ? p->dim : p->hidden_dim;
+    g_xq = (int8_t*) ram_alloc16((size_t)max_n);
+    g_xs = (float*)  ram_alloc((size_t)(max_n / BLOCK_SIZE) * sizeof(float));
+    if (!g_xq || !g_xs) return false;
+  }
+
   if (p->arch == ARCH_GPTNEO) {
-    size_t cache_n  = (size_t)p->n_layers * T->kv_seq_len * kv_dim;
-    size_t scales_n = (size_t)p->n_layers * T->kv_seq_len;
-    s->key_cache8   = (int8_t*) ram_alloc(cache_n);
-    s->value_cache8 = (int8_t*) ram_alloc(cache_n);
-    s->k_scales     = (float*)  ram_alloc(scales_n * sizeof(float));
-    s->v_scales     = (float*)  ram_alloc(scales_n * sizeof(float));
+    size_t nib_n    = (size_t)p->n_layers * T->kv_seq_len * (kv_dim / 2);
+    size_t gscale_n = (size_t)p->n_layers * T->kv_seq_len * (kv_dim / 32);
+    s->key_cache4   = (uint8_t*)  ram_alloc(nib_n);
+    s->value_cache4 = (uint8_t*)  ram_alloc(nib_n);
+    s->k_gscales    = (uint16_t*) ram_alloc(gscale_n * sizeof(uint16_t));
+    s->v_gscales    = (uint16_t*) ram_alloc(gscale_n * sizeof(uint16_t));
     s->key_cache = s->value_cache = NULL;
-    return s->x && s->xb && s->xb2 && s->hb && s->hb2 && s->q && s->k && s->v
-        && s->att && s->logits && s->key_cache8 && s->value_cache8
-        && s->k_scales && s->v_scales;
+    bool ok = s->x && s->xb && s->xb2 && s->hb && s->hb2 && s->q && s->k && s->v
+        && s->att && s->logits && s->key_cache4 && s->value_cache4
+        && s->k_gscales && s->v_gscales;
+#ifdef LLM_USE_PIE
+    if (ok) {
+      // SIMD/scalar parity on real weight rows: the integer block sums are
+      // exact in both, so any real divergence means a broken kernel — fail
+      // the boot rather than generate garbage.
+      for (int i = 0; i < p->dim; i++) g_xq[i] = (int8_t)((i * 37 + 11) & 0xFF);
+      for (int b = 0; b < p->dim / BLOCK_SIZE; b++) g_xs[b] = 0.5f + 0.25f * b;
+      for (int row = 0; row < 8; row++) {
+        const uint8_t* wrow = T->wq_q4 + row * v3_row_stride(p->dim);
+        float ref = dot_q4q8_v3(wrow, g_xq, g_xs, p->dim);
+        float got = dot_q4q8_pie(wrow + v3_nib_off(p->dim), g_xq, wrow, g_xs,
+                                 p->dim / BLOCK_SIZE);
+        float err = fabsf(got - ref);
+        if (err > 1e-3f * (1.0f + fabsf(ref))) return false;
+      }
+    }
+#endif
+    return ok;
   }
 
   s->key_cache   = (uint16_t*) ram_alloc((size_t)p->n_layers * T->kv_seq_len * kv_dim * sizeof(uint16_t));
   s->value_cache = (uint16_t*) ram_alloc((size_t)p->n_layers * T->kv_seq_len * kv_dim * sizeof(uint16_t));
-  s->key_cache8 = s->value_cache8 = NULL;
-  s->k_scales = s->v_scales = NULL;
+  s->key_cache4 = s->value_cache4 = NULL;
+  s->k_gscales = s->v_gscales = NULL;
 
   return s->x && s->xb && s->xb2 && s->hb && s->hb2 && s->q && s->k && s->v
       && s->att && s->logits && s->key_cache && s->value_cache;

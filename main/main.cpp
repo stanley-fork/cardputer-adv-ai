@@ -37,11 +37,19 @@ static Sampler        sampler;
 static ChatUI         ui;
 static Keyboard_Class Keyboard;   // vendored M5Cardputer driver (main/keyboard/)
 
-// KV-cache window. dim=128 × 8 layers × (k+v) at int8 ≈ 2 KB per position
-// (llm.cpp stores the GPT-Neo cache as int8 with per-row scales); 80 positions
-// ≈ 165 KB, sharing ~280 KB free heap with the 48 KB logits buffer. The
-// converter keeps 256 position embeddings, so flash isn't the limit — RAM is.
-static constexpr int KV_SEQ_LEN = 80;
+// KV-cache window. llm.cpp stores the GPT-Neo cache as int4 nibbles with one
+// bf16 scale per 32-element group: ~0.6 KB/position at dim=128 (3M model,
+// 80 positions ≈ 90 KB) and ~1.2 KB/position at dim=256 (8M model — 72
+// positions ≈ 166 KB, sharing ~280 KB free heap with the ~50 KB logits
+// buffer). The converter keeps 256 position embeddings, so flash isn't the
+// limit — RAM is. The window is picked from the model header at boot.
+static int KV_SEQ_LEN = 80;
+static int kvLenForModel() {
+  // dim is bytes 8..11 of the CRDP header (see llm.cpp llm_init_embedded)
+  int dim;
+  memcpy(&dim, MODEL_DATA + 8, 4);
+  return dim <= 128 ? 80 : 72;
+}
 static constexpr float DEFAULT_TEMP  = 0.8f;
 static constexpr float DEFAULT_TOP_P = 0.9f;   // 1.0 = off (full multinomial)
 
@@ -165,6 +173,25 @@ struct GenState {
 
 static void initModel() {
   ui.statusf("Loading model (%u KB)...", (unsigned)(MODEL_DATA_LEN / 1024));
+  {
+    // Flash streaming bandwidth (serial log only). Touching one word per
+    // 64-byte cache line forces a line fill for the whole blob — the same
+    // access pattern the matmuls have. QIO should read ~2x DIO's ~13 MB/s;
+    // if this prints DIO-class numbers, the bootloader header still says DIO
+    // (reflash with esptool, not Launcher).
+    uint32_t t0 = millis();
+    volatile uint32_t sink = 0;
+    const volatile uint32_t* p32 = (const volatile uint32_t*)MODEL_DATA;
+    for (size_t i = 0; i < MODEL_DATA_LEN / 4; i += 16) sink += p32[i];
+    uint32_t dt = millis() - t0;
+    (void)sink;
+    if (dt > 0) {
+      printf("[bench] flash stream: %u KB in %u ms = %.1f MB/s\n",
+             (unsigned)(MODEL_DATA_LEN / 1024), (unsigned)dt,
+             (float)MODEL_DATA_LEN / 1024.0f / 1024.0f * 1000.0f / (float)dt);
+    }
+  }
+  KV_SEQ_LEN = kvLenForModel();
   if (!llm_init_embedded(&transformer, MODEL_DATA, MODEL_DATA_LEN, KV_SEQ_LEN)) {
     ui.fatal("model init failed (bad header or OOM)");
   }
@@ -180,6 +207,17 @@ static void initModel() {
   }
   llm_build_sampler(&sampler, transformer.config.vocab_size, DEFAULT_TEMP, DEFAULT_TOP_P,
                     esp_random());
+  {
+    // Serial-only decode benchmark: three real forward passes. This is the
+    // number the whole design optimizes; if it regresses, check the boot
+    // "SPI Mode" line first (flash streaming is the throughput ceiling).
+    llm_forward(&transformer, 0, 0);          // warm-up (caches, worker task)
+    uint32_t t0 = millis();
+    for (int i = 1; i <= 3; i++) llm_forward(&transformer, 0, i);
+    uint32_t dt = millis() - t0;
+    printf("[bench] forward: %.0f ms/token (%.2f tok/s)\n",
+           (float)dt / 3.0f, 3000.0f / (float)dt);
+  }
 }
 
 // Encode `text` into gen.prompt_tokens starting at *n (bounds-checked).
@@ -362,7 +400,8 @@ static void setup() {
 
   ui.ready();
   ui.statusf("%s  T=%.1f  /new resets  [tab] settings",
-             transformer.config.arch == ARCH_GPTNEO ? "TinyChat-3M" : "TinyLLama-v0",
+             transformer.config.arch != ARCH_GPTNEO ? "TinyLLama-v0" :
+             transformer.config.dim > 128 ? "TinyTalk-2 8M" : "TinyTalk-2 3M",
              settings.temp);
   state = ST_CHAT;
 }

@@ -1,10 +1,13 @@
-// llama2.c-style inference for Maykeye/TinyLLama-v0 (4.6M params, 32K vocab),
-// ported to the M5Stack Cardputer ADV (ESP32-S3FN8, 512KB SRAM, 8MB flash, no PSRAM).
+// llama2.c-style inference engine for the M5Stack Cardputer (ESP32-S3FN8,
+// 512KB SRAM, 8MB flash, no PSRAM). Runs GPT-Neo (TinyStories-Instruct,
+// CRDP v3 blobs) and LLaMA (TinyLLama-v0, CRDP v1 blobs).
 //
-// Differences from the previous fp32 stories260K port:
-//   - Q4_0 quantized weights (~2.5 MB total) instead of fp32 (~18 MB) — fits!
-//   - Weights live in the application .bin via .incbin and are read directly
+//   - Q4_0 quantized weights, embedded in the app .bin and read zero-copy
 //     from MMU-mapped flash. No SD card, no partition install step.
+//   - GPT-Neo matmuls run int8-quantized activations against row-planar Q4
+//     weights on the ESP32-S3 PIE SIMD unit (main/dot_q4_pie.S), split
+//     across both cores; host builds use a matching scalar path.
+//   - GPT-Neo KV cache is int4 with per-32-group bf16 scales.
 //   - Tokenizer is walked from flash; no 256 KB index in heap.
 //   - Sampler: argmax (T=0), full-vocab multinomial (top_p >= 1) or top-p
 //     nucleus over a capped candidate set — no full-vocab sort or probindex.
@@ -42,12 +45,16 @@ typedef struct {
   // lets KV_SEQ_LEN=64 fit in the same 128 KB an fp32 cache needed for 32.
   uint16_t* key_cache;   // bf16 [n_layers, kv_seq_len, kv_dim]
   uint16_t* value_cache; // bf16 [n_layers, kv_seq_len, kv_dim]
-  // GPT-Neo path: dim is 2x the llama model's, so bf16 would halve the usable
-  // context. int8 with one fp32 scale per row keeps 80 positions in ~165 KB.
-  int8_t* key_cache8;    // int8 [n_layers, kv_seq_len, kv_dim]
-  int8_t* value_cache8;  // int8 [n_layers, kv_seq_len, kv_dim]
-  float*  k_scales;      // fp32 [n_layers, kv_seq_len]
-  float*  v_scales;      // fp32 [n_layers, kv_seq_len]
+  // GPT-Neo path: int4 nibbles with one bf16 scale per 32-element group.
+  // Every head (head_size 8 or 16) lies inside a single group, so attention
+  // applies one scale per (head, position). ~1 KB/position at dim=256 —
+  // that's what lets a 72-token window fit the 8M model in internal SRAM.
+  // Nibble packing: dim i lives in byte i/2 (low nibble if even, high if odd),
+  // biased by +8 (stored 1..15, symmetric int4 = clip(round(v/s), ±7)).
+  uint8_t*  key_cache4;   // [n_layers, kv_seq_len, kv_dim/2]
+  uint8_t*  value_cache4; // [n_layers, kv_seq_len, kv_dim/2]
+  uint16_t* k_gscales;    // bf16 [n_layers, kv_seq_len, kv_dim/32]
+  uint16_t* v_gscales;    // bf16 [n_layers, kv_seq_len, kv_dim/32]
 } RunState;
 
 typedef struct {
