@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         main.cpp
         llm.cpp
+        dot_q4_pie.S
         ui.cpp
         model_data.cpp
         tok_data.cpp

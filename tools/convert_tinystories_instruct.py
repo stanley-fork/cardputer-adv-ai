@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
 Convert roneneldan/TinyStories-Instruct-{1M,3M,8M} (GPT-Neo) into:
-  - model_neo_q4.bin : CRDP v2 format (header + fp32 norms/biases/wpe + Q4_0)
+  - model_neo_q4.bin : CRDP v3 format (header + fp32 norms/biases/wpe + Q4_0)
   - tok_neo.bin      : CTK2 byte-level-BPE tokenizer blob (pruned vocab)
+
+v3 stores Q4_0 matrices row-planar for the ESP32-S3 PIE SIMD kernel: each
+row is [nb x bf16 scales][pad to 16B][nb x 16 nibble bytes], so every 128-bit
+vector load of nibbles is 16-byte aligned. All Q4 sections start on a 16-byte
+boundary (row strides are multiples of 16, so alignment is preserved
+throughout). Nibble packing within a block is unchanged from v2: byte k holds
+q[k] in the low nibble and q[k+16] in the high nibble.
 
 The GPT-2 vocab (50257) is pruned to the tokens actually used by the
 TinyStories-Instruct dataset (~10K), which shrinks the embedding table ~5x
@@ -20,11 +27,10 @@ from pathlib import Path
 import numpy as np
 
 MAGIC = b"CRDP"
-VERSION = 2
+VERSION = 3
 ARCH_GPTNEO = 2
 QUANT_Q4_0 = 4
 BLOCK_SIZE = 32
-BYTES_PER_BLOCK = 18
 
 TOK_MAGIC = 0x324B5443  # "CTK2" little-endian
 
@@ -46,26 +52,40 @@ def fp32_to_bf16_u16(x: np.ndarray) -> np.ndarray:
     return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
 
 
-def quantize_q4_0(weights: np.ndarray) -> bytes:
-    """Vectorized Q4_0: per 32-weight block, bf16 scale + 16 packed-nibble bytes."""
-    flat = np.ascontiguousarray(weights, dtype=np.float32).reshape(-1)
-    n = flat.size
-    assert n % BLOCK_SIZE == 0, f"length {n} not divisible by {BLOCK_SIZE}"
-    blk = flat.reshape(-1, BLOCK_SIZE)
+def v3_row_stride(n_cols: int) -> int:
+    """Bytes per matrix row in the v3 row-planar layout."""
+    nb = n_cols // BLOCK_SIZE
+    scale_bytes = 2 * nb
+    pad = (-scale_bytes) % 16
+    return scale_bytes + pad + 16 * nb
 
-    imax = np.abs(blk).argmax(axis=1)
-    maxv = blk[np.arange(blk.shape[0]), imax]
+
+def quantize_q4_v3(weights: np.ndarray, n_cols: int) -> bytes:
+    """Vectorized Q4_0, v3 row-planar layout. `weights` may be any shape whose
+    trailing dimension(s) flatten to rows of n_cols (e.g. [L, out, in])."""
+    w = np.ascontiguousarray(weights, dtype=np.float32).reshape(-1, n_cols)
+    rows, n = w.shape
+    assert n % BLOCK_SIZE == 0, f"row length {n} not divisible by {BLOCK_SIZE}"
+    nb = n // BLOCK_SIZE
+    blk = w.reshape(rows, nb, BLOCK_SIZE)
+
+    imax = np.abs(blk).argmax(axis=2)
+    r_idx = np.arange(rows)[:, None]
+    b_idx = np.arange(nb)[None, :]
+    maxv = blk[r_idx, b_idx, imax]
     d = maxv / -8.0
     inv = np.where(d != 0, 1.0 / np.where(d != 0, d, 1.0), 0.0)
-    q = np.clip(np.floor(blk * inv[:, None] + 8.5).astype(np.int32), 0, 15).astype(np.uint8)
+    q = np.clip(np.floor(blk * inv[:, :, None] + 8.5).astype(np.int32),
+                0, 15).astype(np.uint8)
 
-    scale = fp32_to_bf16_u16(d)
-    packed = (q[:, :16] & 0x0F) | ((q[:, 16:] & 0x0F) << 4)
+    scale = fp32_to_bf16_u16(d)                            # [rows, nb] u16 LE
+    packed = (q[:, :, :16] & 0x0F) | ((q[:, :, 16:] & 0x0F) << 4)
 
-    out = np.zeros((blk.shape[0], BYTES_PER_BLOCK), dtype=np.uint8)
-    out[:, 0] = scale & 0xFF
-    out[:, 1] = scale >> 8
-    out[:, 2:] = packed
+    scale_bytes = 2 * nb
+    pad = (-scale_bytes) % 16
+    out = np.zeros((rows, scale_bytes + pad + 16 * nb), dtype=np.uint8)
+    out[:, :scale_bytes] = scale.astype("<u2").view(np.uint8).reshape(rows, scale_bytes)
+    out[:, scale_bytes + pad:] = packed.reshape(rows, 16 * nb)
     return out.tobytes()
 
 
@@ -228,7 +248,7 @@ def convert_model(snap: Path, out: Path, kept_old_ids, max_pos: int):
         f.write(struct.pack("<BBB", 1, QUANT_Q4_0, ARCH_GPTNEO))  # shared, quant, arch
         f.write(b"\x00" * (64 - f.tell()))
 
-        # fp32 sections, order matched by llm.cpp::llm_init_embedded (v2)
+        # fp32 sections, order matched by llm.cpp::llm_init_embedded (v3)
         for t in (stack("ln_1.weight"), stack("ln_1.bias"),
                   stack("ln_2.weight"), stack("ln_2.bias"),
                   W["transformer.ln_f.weight"], W["transformer.ln_f.bias"],
@@ -237,12 +257,17 @@ def convert_model(snap: Path, out: Path, kept_old_ids, max_pos: int):
                   wpe):
             f.write(np.ascontiguousarray(t, dtype=np.float32).tobytes())
 
-        # Q4_0 sections
-        f.write(quantize_q4_0(wte_pruned))  # also the classifier (tied)
-        for name in ("attn.attention.q_proj.weight", "attn.attention.k_proj.weight",
-                     "attn.attention.v_proj.weight", "attn.attention.out_proj.weight",
-                     "mlp.c_fc.weight", "mlp.c_proj.weight"):
-            f.write(quantize_q4_0(stack(name)))
+        # Q4_0 sections (v3 row-planar), 16B-aligned from here on: row strides
+        # are multiples of 16, so aligning the first section aligns them all.
+        f.write(b"\x00" * ((-f.tell()) % 16))
+        f.write(quantize_q4_v3(wte_pruned, dim))  # also the classifier (tied)
+        for name, n_cols in (("attn.attention.q_proj.weight", dim),
+                             ("attn.attention.k_proj.weight", dim),
+                             ("attn.attention.v_proj.weight", dim),
+                             ("attn.attention.out_proj.weight", dim),
+                             ("mlp.c_fc.weight", dim),
+                             ("mlp.c_proj.weight", hidden)):
+            f.write(quantize_q4_v3(stack(name), n_cols))
         sz = f.tell()
     print(f"[+] {out.name} = {sz:,} bytes ({sz / 1024 / 1024:.2f} MB)")
 
@@ -287,7 +312,7 @@ def emit_cpp_array(bin_path: Path, cpp_path: Path, sym: str):
     with open(cpp_path, "w") as f:
         f.write("// AUTO-GENERATED by tools/convert_tinystories_instruct.py. Do not edit.\n")
         f.write("#include <stdint.h>\n#include <stddef.h>\n\n")
-        f.write(f'extern "C" const uint8_t {sym}[] __attribute__((aligned(4))) = {{\n')
+        f.write(f'extern "C" const uint8_t {sym}[] __attribute__((aligned(16))) = {{\n')
         for i in range(0, len(raw), 16):
             f.write("  " + ",".join(f"0x{b:02x}" for b in raw[i:i + 16]) + ",\n")
         f.write("};\n\n")
