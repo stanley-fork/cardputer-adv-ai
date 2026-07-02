@@ -9,5 +9,6 @@
   "model_max_length": 2048,
   "pad_token": null,
   "tokenizer_class": "GPT2Tokenizer",
-  "unk_token": "<|endoftext|>"
+  "unk_token": "<|endoftext|>",
+  "chat_template": "{% for m in messages %}{% if m['role'] == 'user' %}User: {{ m['content'] }}\n{% else %}Bot: {{ m['content'] }}<|endoftext|>\n{% endif %}{% endfor %}Bot:"
 }

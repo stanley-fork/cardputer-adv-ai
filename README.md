@@ -255,6 +255,18 @@ ships 256 position embeddings, so RAM is the binding constraint, not flash.
 - Chat quality is bounded by 8M params — noticeably better grammar and
   context-tracking than 3M, still no real-world knowledge.
 
+## Get the model (without a Cardputer)
+
+The chat fine-tune is published as **TinyTalk 2**:
+
+- [TheREZOR/TinyTalk-2](https://huggingface.co/TheREZOR/TinyTalk-2) —
+  safetensors (transformers, GPT-Neo), with embedded chat template
+- [TheREZOR/TinyTalk-2-GGUF](https://huggingface.co/TheREZOR/TinyTalk-2-GGUF) —
+  GGUF for llama.cpp / Ollama: `ollama run hf.co/TheREZOR/TinyTalk-2-GGUF`
+  (GGUF uses a mathematically-exact GPT-2 conversion, `tools/export_gpt2.py`,
+  since llama.cpp doesn't support plain GPT-Neo)
+- [TheREZOR/TinyTalk](https://huggingface.co/TheREZOR/TinyTalk) — v1 (3M)
+
 ## Changelog
 
 - **v2.0** — the **TinyTalk 2** release
