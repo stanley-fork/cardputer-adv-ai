@@ -6,7 +6,8 @@
 //   - Weights live in the application .bin via .incbin and are read directly
 //     from MMU-mapped flash. No SD card, no partition install step.
 //   - Tokenizer is walked from flash; no 256 KB index in heap.
-//   - Sampler: argmax + multinomial only (no top-p / probindex).
+//   - Sampler: argmax (T=0), full-vocab multinomial (top_p >= 1) or top-p
+//     nucleus over a capped candidate set — no full-vocab sort or probindex.
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
@@ -104,6 +105,7 @@ typedef struct {
 typedef struct {
   int vocab_size;
   float temperature;
+  float top_p;        // nucleus mass; >= 1.0 disables (full multinomial)
   uint64_t rng_state;
 } Sampler;
 
@@ -117,7 +119,8 @@ bool   llm_init_embedded(Transformer* t, const uint8_t* model_bytes, size_t mode
 bool   llm_tokenizer_from_memory(Tokenizer* tk, const uint8_t* data, size_t size,
                                  int vocab_size);
 
-void   llm_build_sampler(Sampler* s, int vocab_size, float temperature, uint64_t seed);
+void   llm_build_sampler(Sampler* s, int vocab_size, float temperature, float top_p,
+                         uint64_t seed);
 
 float* llm_forward(Transformer* t, int token, int pos);
 int    llm_sample(Sampler* s, float* logits);

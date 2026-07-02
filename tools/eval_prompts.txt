@@ -1,0 +1,35 @@
+# Fixed prompt battery for eval_battery.py. Tab-separated: type<TAB>text[<TAB>expect]
+# Types:
+#   chat  — user turn; scored for over-refusal (a deflection here is a FAIL)
+#   multi — full multi-turn prompt with <|eos|> markers, battery appends nothing
+#   fact  — user turn; PASS if any expect keyword (comma-sep) is in the reply
+#   idk   — user turn the model can't know; PASS if the reply deflects
+#   story — full story-mode prompt, printed for eyeballing only
+chat	hi! how are you today?
+chat	what is your name?
+chat	i had a great day at school!
+chat	do you want to play a game?
+chat	i am feeling a bit sad today.
+chat	tell me about your day.
+chat	what do you like to do for fun?
+chat	my dog ran away this morning.
+multi	User: hi there!\nBot: Hi! How are you?<|eos|>\nUser: i am good. what should we talk about?\nBot:
+multi	User: i have a new cat!\nBot: That is so fun! What is its name?<|eos|>\nUser: her name is Daisy. she is very small.\nBot:
+fact	what color is the sky?	blue
+fact	what color is grass?	green
+fact	what sound does a dog make?	woof
+fact	what sound does a cat make?	meow
+fact	how many legs does a spider have?	eight
+fact	what is a baby dog called?	puppy
+fact	what is the opposite of hot?	cold
+fact	what do bees make?	honey
+idk	what is the capital of France?
+idk	who wrote Romeo and Juliet?
+idk	what is photosynthesis?
+idk	how far away is the moon?
+idk	what is two hundred times forty five?
+idk	who is the president of the United States?
+idk	what is DNA made of?
+idk	why do volcanoes erupt?
+story	Summary: a little girl finds a lost puppy in the park.\nStory:
+story	Summary: two friends build a big sand castle by the sea.\nStory:

@@ -305,6 +305,9 @@ def main():
                          "(e.g. data/chat_train.txt); repeatable")
     ap.add_argument("--min-count", type=int, default=3,
                     help="keep tokens appearing >= N times in the dataset sample")
+    ap.add_argument("--max-vocab", type=int, default=15500,
+                    help="hard cap on the pruned vocab (the logits buffer is "
+                         "vocab*4 bytes of internal SRAM); fail if exceeded")
     ap.add_argument("--max-pos", type=int, default=256,
                     help="position embeddings to keep (= max context)")
     ap.add_argument("--out-dir", default=str(Path(__file__).resolve().parent.parent))
@@ -333,6 +336,13 @@ def main():
     old2new, pieces, merges, eos_new = build_kept_vocab(snap, valid, args.min_count,
                                                         args.corpus)
     kept = sorted(old2new, key=old2new.get)
+    print(f"[+] logits buffer at this vocab: {len(kept) * 4 / 1024:.1f} KB of "
+          f"internal SRAM")
+    if len(kept) > args.max_vocab:
+        raise SystemExit(
+            f"pruned vocab {len(kept):,} exceeds --max-vocab {args.max_vocab:,} "
+            f"({len(kept) * 4 / 1024:.1f} KB logits). Raise --min-count (fewer "
+            f"rare tokens) or --max-vocab (if the RAM budget allows).")
     print(f"[+] eos id (pruned): {eos_new}")
 
     model_bin = tmp / "model_neo_q4.bin"

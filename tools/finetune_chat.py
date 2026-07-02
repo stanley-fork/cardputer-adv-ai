@@ -112,6 +112,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--out-dir", default="data/chat_model")
+    ap.add_argument("--base", default="3M", choices=["1M", "3M", "8M"],
+                    help="TinyStories-Instruct base model size")
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--seq-len", type=int, default=256)
     ap.add_argument("--batch-size", type=int, default=32)
@@ -126,7 +128,7 @@ def main():
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"[+] device: {device}")
 
-    snap = snapshot_download(repo_id="roneneldan/TinyStories-Instruct-3M",
+    snap = snapshot_download(repo_id=f"roneneldan/TinyStories-Instruct-{args.base}",
                              cache_dir=args.cache,
                              allow_patterns=["*.bin", "*.json", "merges.txt", "vocab.json"])
     tokenizer = GPT2TokenizerFast.from_pretrained(snap)

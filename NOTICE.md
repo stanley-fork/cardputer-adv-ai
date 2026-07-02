@@ -22,6 +22,19 @@ embedded model and tokenizer artifacts derive from the following works:
 - **TinyStoriesInstruct**
   (https://huggingface.co/datasets/roneneldan/TinyStoriesInstruct),
   CDLA-Sharing-1.0 (per the TinyStories dataset family).
+- **DailyDialog**
+  (https://huggingface.co/datasets/li2017dailydialog/daily_dialog),
+  **CC BY-NC-SA 4.0 (non-commercial)**. Li et al., *DailyDialog: A Manually
+  Labelled Multi-turn Dialogue Dataset* (arXiv:1710.03957). Filtered subset
+  used in the chat fine-tune.
+- **SciQ** (https://huggingface.co/datasets/allenai/sciq),
+  **CC BY-NC 3.0 (non-commercial)**. Welbl et al., *Crowdsourcing Multiple
+  Choice Science Questions* (arXiv:1707.06209). Only question texts are
+  used (paired with hand-written deflection replies) to teach graceful
+  "I don't know" behavior.
+
+Note: the DailyDialog and SciQ licenses are non-commercial; a model
+fine-tuned on them should not be distributed commercially.
 
 ## Tokenizer
 

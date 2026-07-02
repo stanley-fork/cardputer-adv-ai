@@ -836,11 +836,14 @@ const char* llm_decode(Tokenizer* tk, int prev, int token, char* scratch, size_t
 }
 
 // ============================================================================
-//  Sampler — argmax (T=0) or full-vocab multinomial. No probindex (no top-p).
+//  Sampler — argmax (T=0), full-vocab multinomial (top_p >= 1), or top-p
+//  nucleus limited to the TOP_P_CAP most likely tokens (see llm_sample).
 // ============================================================================
-void llm_build_sampler(Sampler* s, int vocab_size, float temperature, uint64_t seed) {
+void llm_build_sampler(Sampler* s, int vocab_size, float temperature, float top_p,
+                       uint64_t seed) {
   s->vocab_size  = vocab_size;
   s->temperature = temperature;
+  s->top_p       = top_p;
   s->rng_state   = seed ? seed : 0xC0FFEEull;
 }
 static uint32_t rng_u32(uint64_t* st) {
@@ -859,10 +862,62 @@ int llm_sample(Sampler* s, float* logits) {
   for (int i = 0; i < s->vocab_size; i++) logits[i] /= s->temperature;
   softmax(logits, s->vocab_size);
   float coin = rng_f32(&s->rng_state);
-  float c = 0;
-  for (int i = 0; i < s->vocab_size; i++) {
-    c += logits[i];
-    if (coin < c) return i;
+  if (s->top_p >= 1.0f) {
+    float c = 0;
+    for (int i = 0; i < s->vocab_size; i++) {
+      c += logits[i];
+      if (coin < c) return i;
+    }
+    return s->vocab_size - 1;
   }
-  return s->vocab_size - 1;
+  // Top-p over the TOP_P_CAP most likely tokens: one pass keeps the largest
+  // probs in a small min-tracked array (~1 compare/token), then the nucleus
+  // is cut inside that set. The cap only bites when the nucleus is wider
+  // than TOP_P_CAP tokens (very high temperature), where trimming the tail
+  // is what top-p is for anyway. Statics keep the buffers off the stack.
+  constexpr int TOP_P_CAP = 64;
+  static float tp_prob[TOP_P_CAP];
+  static int   tp_id[TOP_P_CAP];
+  int   n    = 0;      // candidates held
+  int   lo   = 0;      // index of the smallest held prob
+  float lo_p = 0.0f;
+  for (int i = 0; i < s->vocab_size; i++) {
+    float p = logits[i];
+    if (n < TOP_P_CAP) {
+      tp_prob[n] = p; tp_id[n] = i;
+      if (n == 0 || p < lo_p) { lo = n; lo_p = p; }
+      n++;
+      if (n == TOP_P_CAP) {   // settle the true minimum before replacements
+        lo = 0; lo_p = tp_prob[0];
+        for (int j = 1; j < TOP_P_CAP; j++)
+          if (tp_prob[j] < lo_p) { lo = j; lo_p = tp_prob[j]; }
+      }
+    } else if (p > lo_p) {
+      tp_prob[lo] = p; tp_id[lo] = i;
+      lo = 0; lo_p = tp_prob[0];
+      for (int j = 1; j < TOP_P_CAP; j++)
+        if (tp_prob[j] < lo_p) { lo = j; lo_p = tp_prob[j]; }
+    }
+  }
+  // Insertion-sort the survivors descending (n <= 64).
+  for (int i = 1; i < n; i++) {
+    float p = tp_prob[i]; int id = tp_id[i];
+    int j = i - 1;
+    while (j >= 0 && tp_prob[j] < p) { tp_prob[j+1] = tp_prob[j]; tp_id[j+1] = tp_id[j]; j--; }
+    tp_prob[j+1] = p; tp_id[j+1] = id;
+  }
+  // Cut the nucleus (always include the top token), then draw within it.
+  float cum = 0.0f;
+  int   cut = n;
+  for (int i = 0; i < n; i++) {
+    cum += tp_prob[i];
+    if (cum >= s->top_p) { cut = i + 1; break; }
+  }
+  float target = coin * cum;
+  float c = 0.0f;
+  for (int i = 0; i < cut; i++) {
+    c += tp_prob[i];
+    if (target < c) return tp_id[i];
+  }
+  return tp_id[cut - 1];
 }
