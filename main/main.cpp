@@ -42,7 +42,8 @@ static Keyboard_Class Keyboard;   // vendored M5Cardputer driver (main/keyboard/
 // ≈ 165 KB, sharing ~280 KB free heap with the 48 KB logits buffer. The
 // converter keeps 256 position embeddings, so flash isn't the limit — RAM is.
 static constexpr int KV_SEQ_LEN = 80;
-static constexpr float DEFAULT_TEMP = 0.8f;
+static constexpr float DEFAULT_TEMP  = 0.8f;
+static constexpr float DEFAULT_TOP_P = 0.9f;   // 1.0 = off (full multinomial)
 
 enum AppState { ST_BOOT, ST_CHAT, ST_SETTINGS };
 static AppState state = ST_BOOT;
@@ -56,13 +57,14 @@ enum ChatMode { M_CHAT, M_STORY, M_RAW };
 
 struct Settings {
   float temp      = DEFAULT_TEMP;     // 0.0 = greedy (argmax)
+  float top_p     = DEFAULT_TOP_P;    // nucleus mass; 1.0 = off
   int   max_reply = 44;               // tokens per reply; -1 = unlimited (stop at KV or EOS);
                                       // -2 = unsafe (wrap KV pos, run until EOS fires)
   int   mode      = M_CHAT;
 };
 static Settings settings;
 static int sett_sel = 0;
-static constexpr int SETT_N = 4;
+static constexpr int SETT_N = 5;
 
 static const char* modeName(int m) {
   switch (m) {
@@ -73,16 +75,18 @@ static const char* modeName(int m) {
 }
 
 static void drawSettings() {
-  std::string names[SETT_N]  = {"Mode", "Temperature", "Max reply tokens", "RNG seed"};
+  std::string names[SETT_N]  = {"Mode", "Temperature", "Top-p", "Max reply tokens", "RNG seed"};
   std::string values[SETT_N];
-  char tbuf[16];
+  char tbuf[16], pbuf[16];
   snprintf(tbuf, sizeof(tbuf), "%.1f", settings.temp);
+  snprintf(pbuf, sizeof(pbuf), "%.2f", settings.top_p);
   values[0] = modeName(settings.mode);
   values[1] = settings.temp < 0.05f ? "0.0 greedy" : tbuf;
-  values[2] = settings.max_reply == -2 ? "unsafe" :
+  values[2] = settings.top_p >= 1.0f ? "1.00 off" : pbuf;
+  values[3] = settings.max_reply == -2 ? "unsafe" :
               settings.max_reply <  0  ? "unlimited" :
                                          std::to_string(settings.max_reply);
-  values[3] = "reroll with , /";
+  values[4] = "reroll with , /";
   ui.showSettings("Settings", names, values, SETT_N, sett_sel);
 }
 
@@ -97,15 +101,20 @@ static void adjustSetting(int dir) {
       sampler.temperature = settings.temp;        // takes effect immediately
       break;
     case 2:
+      settings.top_p = roundf((settings.top_p + 0.05f * dir) * 20.0f) / 20.0f;
+      settings.top_p = clampf(settings.top_p, 0.05f, 1.0f);
+      sampler.top_p = settings.top_p;             // takes effect immediately
+      break;
+    case 3:
       if      (dir < 0 && settings.max_reply == -1) settings.max_reply = -2;
       else if (dir < 0 && settings.max_reply <= 4)  settings.max_reply = -1;
       else if (dir > 0 && settings.max_reply == -2) settings.max_reply = -1;
       else if (dir > 0 && settings.max_reply <  0)  settings.max_reply = 4;
       else settings.max_reply = clampi(settings.max_reply + dir, 4, KV_SEQ_LEN - 8);
       break;
-    case 3:
+    case 4:
       llm_build_sampler(&sampler, transformer.config.vocab_size,
-                        settings.temp, esp_random());
+                        settings.temp, settings.top_p, esp_random());
       break;
   }
   drawSettings();
@@ -138,7 +147,8 @@ static void historyClear() {
 static void leaveSettings() {
   state = ST_CHAT;
   ui.repaint();
-  ui.statusf("T=%.1f  len=%d  [tab] settings", settings.temp, settings.max_reply);
+  ui.statusf("T=%.1f P=%.2f len=%d  [tab] settings",
+             settings.temp, settings.top_p, settings.max_reply);
 }
 
 struct GenState {
@@ -168,7 +178,8 @@ static void initModel() {
   if (tokenizer.vocab_size != transformer.config.vocab_size) {
     ui.fatal("model/tokenizer vocab mismatch - clean rebuild needed");
   }
-  llm_build_sampler(&sampler, transformer.config.vocab_size, DEFAULT_TEMP, esp_random());
+  llm_build_sampler(&sampler, transformer.config.vocab_size, DEFAULT_TEMP, DEFAULT_TOP_P,
+                    esp_random());
 }
 
 // Encode `text` into gen.prompt_tokens starting at *n (bounds-checked).

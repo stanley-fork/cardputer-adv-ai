@@ -1,6 +1,45 @@
 {
-  "train_samples": 76525,
-  "val_samples": 772,
-  "chat_chars": 17149588,
-  "story_chars": 7349823
+  "train_samples": 143022,
+  "val_samples": 1444,
+  "chat_chars": 32779263,
+  "story_chars": 14048255,
+  "sources": {
+    "soda": {
+      "samples": 115331,
+      "chars": 30000007,
+      "scanned": 135999
+    },
+    "dailydialog": {
+      "samples": 8853,
+      "chars": 1709033
+    },
+    "qa": {
+      "samples": 1011,
+      "chars": 115355
+    },
+    "idk": {
+      "samples": 6000,
+      "chars": 954868
+    },
+    "stories": {
+      "samples": 13271,
+      "chars": 14048255
+    }
+  },
+  "args": {
+    "dialogues": 500000,
+    "max_chat_chars": 30000000,
+    "max_words": 22,
+    "max_oov": 0.02,
+    "min_turns": 2,
+    "story_frac": 0.3,
+    "val_frac": 0.01,
+    "prefix_only": false,
+    "rename_speakers": true,
+    "dailydialog": true,
+    "qa_repeat": 5,
+    "idk_max": 6000,
+    "idk_followup_frac": 0.4,
+    "out_dir": "data"
+  }
 }

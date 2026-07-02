@@ -5,7 +5,8 @@
 //   clang++ -std=c++17 -O2 -I tools/host tools/host/host_test.cpp main/llm.cpp -o /tmp/llm_host
 // Run:
 //   /tmp/llm_host embed/model_neo_q4.bin embed/tok_neo.bin "Summary: ...\nStory:" [opts]
-// Options: --max N   --temp F   --kv N   --top10 (print top-10 logits per step)
+// Options: --max N   --temp F   --top-p F   --seed N   --kv N
+//          --top10 (print top-10 logits per step)
 #include "../../main/llm.h"
 #include <cstdio>
 #include <cstdlib>
@@ -27,14 +28,17 @@ static std::vector<uint8_t> slurp(const char* path) {
 }
 
 int main(int argc, char** argv) {
-  if (argc < 4) { fprintf(stderr, "usage: %s model.bin tok.bin prompt [--max N] [--temp F] [--kv N] [--top10]\n", argv[0]); return 1; }
+  if (argc < 4) { fprintf(stderr, "usage: %s model.bin tok.bin prompt [--max N] [--temp F] [--top-p F] [--seed N] [--kv N] [--top10]\n", argv[0]); return 1; }
   std::string prompt = argv[3];
   int   max_new = 80, kv = 96;
-  float temp = 0.0f;
+  float temp = 0.0f, top_p = 1.0f;
+  unsigned long seed = 1234;
   bool  top10 = false;
   for (int i = 4; i < argc; i++) {
     if (!strcmp(argv[i], "--max"))  max_new = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--temp")) temp = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--top-p")) top_p = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--seed")) seed = strtoul(argv[++i], nullptr, 10);
     else if (!strcmp(argv[i], "--kv"))   kv = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--top10")) top10 = true;
   }
@@ -55,7 +59,7 @@ int main(int argc, char** argv) {
   if (!llm_tokenizer_from_memory(&K, tok.data(), tok.size(), T.config.vocab_size)) {
     fprintf(stderr, "tokenizer init failed\n"); return 1;
   }
-  llm_build_sampler(&S, T.config.vocab_size, temp, 1234);
+  llm_build_sampler(&S, T.config.vocab_size, temp, top_p, seed);
   fprintf(stderr, "arch=%d dim=%d hidden=%d layers=%d heads=%d vocab=%d seq=%d kv=%d\n",
           T.config.arch, T.config.dim, T.config.hidden_dim, T.config.n_layers,
           T.config.n_heads, T.config.vocab_size, T.config.seq_len, T.kv_seq_len);
