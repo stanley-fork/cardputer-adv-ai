@@ -426,7 +426,7 @@ static float* forward_llama(Transformer* T, int token, int pos) {
 //  of 256 >= kv_seq_len, so they degenerate to global causal attention; and
 //  GPT-Neo famously does NOT scale attention scores by 1/sqrt(head_size).
 // ============================================================================
-static float* forward_gptneo(Transformer* T, int token, int pos) {
+static float* forward_gptneo(Transformer* T, int token, int pos, int abspos) {
   Config* p = &T->config;
   RunState* s = &T->state;
   int dim        = p->dim;
@@ -434,12 +434,17 @@ static float* forward_gptneo(Transformer* T, int token, int pos) {
   int hidden_dim = p->hidden_dim;
   int head_size  = dim / p->n_heads;
   int kvL        = T->kv_seq_len;
-  if (pos >= kvL) pos = kvL - 1;
+  if (pos >= kvL) pos = kvL - 1;        // physical write slot / attention range
+  // The learned position table has exactly seq_len rows; once a sliding window
+  // pushes the sequence past that, we saturate at the last row rather than read
+  // out of bounds (positions degrade, but the window keeps producing tokens).
+  if (abspos >= p->seq_len) abspos = p->seq_len - 1;
+  if (abspos < 0) abspos = 0;
 
   // ---- token embedding + position embedding ----
   {
     dequant_q4_row_v3(s->x, T->token_embed_q4 + (size_t)token * v3_row_stride(dim), dim);
-    const float* pe = T->wpe + (size_t)pos * dim;
+    const float* pe = T->wpe + (size_t)abspos * dim;
     for (int i = 0; i < dim; i++) s->x[i] += pe[i];
   }
 
@@ -547,9 +552,51 @@ static float* forward_gptneo(Transformer* T, int token, int pos) {
   return s->logits;
 }
 
+float* llm_forward_at(Transformer* T, int token, int write_slot, int abspos) {
+  return (T->config.arch == ARCH_GPTNEO)
+             ? forward_gptneo(T, token, write_slot, abspos)
+             : forward_llama(T, token, write_slot);   // RoPE rotates on write_slot
+}
+
 float* llm_forward(Transformer* T, int token, int pos) {
-  return (T->config.arch == ARCH_GPTNEO) ? forward_gptneo(T, token, pos)
-                                         : forward_llama(T, token, pos);
+  return llm_forward_at(T, token, pos, pos);
+}
+
+int llm_kv_slide(Transformer* T, int keep_head, int evict) {
+  // Only the GPT-Neo int4 cache path is slid; the LLaMA bf16 path bakes
+  // position in via RoPE and would need re-rotation, which we don't do here.
+  if (T->config.arch != ARCH_GPTNEO) return 0;
+  Config* p   = &T->config;
+  RunState* s = &T->state;
+  int kvL      = T->kv_seq_len;
+  int kv_dim   = p->dim;                 // n_kv_heads == n_heads
+  int n_groups = kv_dim / 32;
+  if (keep_head < 0)     keep_head = 0;
+  if (keep_head >= kvL)  return 0;
+  int move_from = keep_head + evict;
+  if (evict < 1 || move_from >= kvL) return 0;
+  // Slots shifted down into the gap. This counts to the end of the cache, so
+  // the last one copied is the not-yet-written slot the caller is about to
+  // write — it lands exactly on the new write position and is overwritten
+  // before anything attends to it.
+  int n_move = kvL - move_from;
+
+  size_t kv_row = (size_t)(kv_dim / 2);  // nibble bytes per slot
+  for (int l = 0; l < p->n_layers; l++) {
+    uint8_t*  kb = s->key_cache4   + (size_t)l * kvL * kv_row;
+    uint8_t*  vb = s->value_cache4 + (size_t)l * kvL * kv_row;
+    uint16_t* kg = s->k_gscales    + (size_t)l * kvL * n_groups;
+    uint16_t* vg = s->v_gscales    + (size_t)l * kvL * n_groups;
+    memmove(kb + (size_t)keep_head * kv_row,
+            kb + (size_t)move_from * kv_row, (size_t)n_move * kv_row);
+    memmove(vb + (size_t)keep_head * kv_row,
+            vb + (size_t)move_from * kv_row, (size_t)n_move * kv_row);
+    memmove(kg + (size_t)keep_head * n_groups,
+            kg + (size_t)move_from * n_groups, (size_t)n_move * n_groups * sizeof(uint16_t));
+    memmove(vg + (size_t)keep_head * n_groups,
+            vg + (size_t)move_from * n_groups, (size_t)n_move * n_groups * sizeof(uint16_t));
+  }
+  return evict;
 }
 
 // ============================================================================

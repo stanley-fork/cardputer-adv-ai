@@ -130,6 +130,28 @@ void   llm_build_sampler(Sampler* s, int vocab_size, float temperature, float to
                          uint64_t seed);
 
 float* llm_forward(Transformer* t, int token, int pos);
+
+// Like llm_forward, but decouples the physical KV write slot (`write_slot`,
+// bounds the cache and the causal attention range) from the absolute sequence
+// position (`abspos`) fed to the GPT-Neo learned position embedding. This is
+// what makes a sliding context window possible: after evicting old slots the
+// write slot drops back down while abspos keeps climbing. llm_forward() passes
+// pos for both. (LLaMA/RoPE ignores abspos and rotates on write_slot.)
+float* llm_forward_at(Transformer* t, int token, int write_slot, int abspos);
+
+// Sliding-window KV eviction (GPT-Neo int4 cache only). Keeps slots
+// [0, keep_head) pinned — a prefix, which the caller sizes and which is NOT
+// necessarily the whole prompt; where that band lands decides what the model
+// forgets, so choose it deliberately. Drops `evict` slots starting at
+// keep_head, and shifts every later slot down to close the gap — for all
+// layers and both key/value nibble planes and their group scales. Cached keys
+// keep the absolute position baked into them at encode time; only the physical
+// layout moves, so the caller must advance abspos independently.
+// Returns the number of slots actually evicted, or 0 if the cache was left
+// untouched (unsupported arch, or degenerate keep_head/evict). Callers MUST
+// rewind their write position by the return value, not by what they asked for.
+int    llm_kv_slide(Transformer* t, int keep_head, int evict);
+
 int    llm_sample(Sampler* s, float* logits);
 
 void   llm_encode(Tokenizer* tk, const char* text, int8_t bos, int8_t eos,

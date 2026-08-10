@@ -245,7 +245,16 @@ ships 256 position embeddings, so RAM is the binding constraint, not flash.
 ## What's not great yet
 
 - 80 tokens of context ≈ 3 short exchanges of conversational memory; older
-  turns silently fall out of the prompt.
+  turns silently fall out of the prompt. Within a single reply the window
+  now *slides* rather than stopping, so replies can run past it — but
+  sliding evicts old context to make room, so a long reply trades memory
+  for length.
+- Reply length tops out around 250 tokens of *useful* output. That is the
+  model, not the firmware: TinyStories-Instruct-8M was fine-tuned at
+  `--seq-len 256`, and generating past that (even in PyTorch with full
+  attention and no sliding window) degenerates into looping `Summary:`
+  fragments. The converter's 256 position embeddings sit right at that
+  limit deliberately — exporting more buys tokens the model can't use.
 - Only kindergarten facts. Everything else gets a (trained) "I don't know" —
   for real factual Q&A you'd need Wi-Fi + an API, or different hardware.
 - ~5 tok/s measured on device for the 8M model (196 ms/token; PIE SIMD +
@@ -269,6 +278,29 @@ The chat fine-tune is published as **TinyTalk 2**:
 
 ## Changelog
 
+- **v2.1** — sliding context window
+  - **Replies no longer stop at the KV window.** When the cache fills mid-reply
+    the window slides: a quarter-window prefix stays pinned as an attention
+    sink, the oldest slots after it are evicted, and generation continues. The
+    physical KV slot and the absolute sequence position are now tracked
+    separately (`llm_forward_at` / `llm_kv_slide`), since GPT-Neo bakes its
+    learned position into the cached keys and they can't be re-rotated.
+  - Fixes a bug where a prompt of ≥55 tokens (routine in chat mode, which packs
+    history to a 64-token budget) would rewind into prompt replay after a slide
+    and silently re-inject its own tail mid-reply, forever.
+  - Where the eviction band lands matters: pinning half the window pinned the
+    *oldest* history and cut straight through the question being answered. The
+    quarter-window pin drops stale history instead, so the live turn survives
+    the first slide — a reply long enough to slide twice still loses it.
+  - Generation now stops cleanly when the model's 256 position embeddings run
+    out, instead of reusing the last row and degenerating.
+  - Reply length is decoupled from the KV window: the setting goes up to 256
+    (was 64) with coarse steps, plus **until eos (slides)** below 4. The
+    default stays bounded — unlimited is opt-in. The old **unsafe** mode is
+    gone; sliding replaces it and doesn't corrupt the cache.
+  - `tools/host/host_test.cpp` mirrors the firmware's generation loop
+    (`--slide`, `--sink N`, `--old-policy`, `--replay-by-pos`) and reports
+    which prompt tokens each slide drops, so the policy is testable on a host.
 - **v2.0** — the **TinyTalk 2** release
   ([TinyTalk 1 on HuggingFace](https://huggingface.co/TheREZOR/TinyTalk))
   - **8M model** (dim=256): same chat fine-tune recipe on

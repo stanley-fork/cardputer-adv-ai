@@ -52,6 +52,16 @@ static int kvLenForModel() {
 }
 static constexpr float DEFAULT_TEMP  = 0.8f;
 static constexpr float DEFAULT_TOP_P = 0.9f;   // 1.0 = off (full multinomial)
+// Upper bound for a *numeric* max-reply setting. The sliding window decouples
+// this from KV_SEQ_LEN, but not from the learned position table: past seq_len
+// positions every token reuses the last wpe row, so that is the real ceiling.
+// Set from the model header at boot.
+static int MAX_REPLY_CAP = 256;
+// Sliding-window eviction geometry, as a fraction of the KV window: at most
+// KV_SEQ_LEN/SLIDE_DIV slots stay pinned at the head, and each slide drops
+// KV_SEQ_LEN/SLIDE_DIV slots after them. A quarter is the useful compromise -
+// see the eviction-band reasoning at the slide site in stepGeneration().
+static constexpr int SLIDE_DIV = 4;
 
 enum AppState { ST_BOOT, ST_CHAT, ST_SETTINGS };
 static AppState state = ST_BOOT;
@@ -66,8 +76,11 @@ enum ChatMode { M_CHAT, M_STORY, M_RAW };
 struct Settings {
   float temp      = DEFAULT_TEMP;     // 0.0 = greedy (argmax)
   float top_p     = DEFAULT_TOP_P;    // nucleus mass; 1.0 = off
-  int   max_reply = 44;               // tokens per reply; -1 = unlimited (stop at KV or EOS);
-                                      // -2 = unsafe (wrap KV pos, run until EOS fires)
+  int   max_reply = 44;               // tokens per reply; -1 = run until EOS, sliding the
+                                      // context window (still bounded by seq_len positions).
+                                      // Stays a bounded default on purpose - unlimited is
+                                      // opt-in from the settings screen, not the out-of-box
+                                      // behaviour.
   int   mode      = M_CHAT;
 };
 static Settings settings;
@@ -91,9 +104,8 @@ static void drawSettings() {
   values[0] = modeName(settings.mode);
   values[1] = settings.temp < 0.05f ? "0.0 greedy" : tbuf;
   values[2] = settings.top_p >= 1.0f ? "1.00 off" : pbuf;
-  values[3] = settings.max_reply == -2 ? "unsafe" :
-              settings.max_reply <  0  ? "unlimited" :
-                                         std::to_string(settings.max_reply);
+  values[3] = settings.max_reply < 0 ? "until eos (slides)"
+                                     : std::to_string(settings.max_reply);
   values[4] = "reroll with , /";
   ui.showSettings("Settings", names, values, SETT_N, sett_sel);
 }
@@ -114,11 +126,19 @@ static void adjustSetting(int dir) {
       sampler.top_p = settings.top_p;             // takes effect immediately
       break;
     case 3:
-      if      (dir < 0 && settings.max_reply == -1) settings.max_reply = -2;
-      else if (dir < 0 && settings.max_reply <= 4)  settings.max_reply = -1;
-      else if (dir > 0 && settings.max_reply == -2) settings.max_reply = -1;
-      else if (dir > 0 && settings.max_reply <  0)  settings.max_reply = 4;
-      else settings.max_reply = clampi(settings.max_reply + dir, 4, KV_SEQ_LEN - 8);
+      // The window now slides, so the reply length is decoupled from the KV
+      // window: numbers can run well past it, and -1 keeps sliding until EOS
+      // (or a `\`` press, or the position table runs out at seq_len). Scroll
+      // below 4 to reach it.
+      if      (dir < 0 && settings.max_reply <= 4) settings.max_reply = -1;
+      else if (dir > 0 && settings.max_reply <  0) settings.max_reply = 4;
+      else {
+        // Coarse steps once the numbers get big - MAX_REPLY_CAP is the model's
+        // whole position table, and stepping there one token at a time is a
+        // few hundred keypresses.
+        int step = settings.max_reply < 32 ? 1 : (settings.max_reply < 128 ? 8 : 32);
+        settings.max_reply = clampi(settings.max_reply + dir * step, 4, MAX_REPLY_CAP);
+      }
       break;
     case 4:
       llm_build_sampler(&sampler, transformer.config.vocab_size,
@@ -155,20 +175,26 @@ static void historyClear() {
 static void leaveSettings() {
   state = ST_CHAT;
   ui.repaint();
-  ui.statusf("T=%.1f P=%.2f len=%d  [tab] settings",
-             settings.temp, settings.top_p, settings.max_reply);
+  if (settings.max_reply < 0)
+    ui.statusf("T=%.1f P=%.2f len=eos  [tab] settings",
+               settings.temp, settings.top_p);
+  else
+    ui.statusf("T=%.1f P=%.2f len=%d  [tab] settings",
+               settings.temp, settings.top_p, settings.max_reply);
 }
 
 struct GenState {
   bool active = false;
   int pos = 0, next = 0, token = 0, n_prompt = 0;
+  int abspos = 0;          // absolute sequence position (feeds the wpe table);
+                           // climbs even after the window slides pos back down
   int* prompt_tokens = nullptr;
   uint32_t t_start_ms = 0;
   int tokens_out = 0;
   std::string user_text;   // chat mode: pending exchange for the history
   std::string bot_text;
   bool pending_nl = false; // hold back a lone "\n" until we know what follows
-  bool wrapped    = false; // true if unsafe mode has wrapped pos (context corrupted)
+  bool slid       = false; // true once the context window has slid at least once
 } gen;
 
 static void initModel() {
@@ -195,6 +221,11 @@ static void initModel() {
   if (!llm_init_embedded(&transformer, MODEL_DATA, MODEL_DATA_LEN, KV_SEQ_LEN)) {
     ui.fatal("model init failed (bad header or OOM)");
   }
+  // llm_init_embedded clamps the requested window to the model's seq_len; read
+  // back what it actually allocated so the slide arithmetic here can't drift
+  // from the cache llm.cpp indexes.
+  KV_SEQ_LEN   = transformer.kv_seq_len;
+  MAX_REPLY_CAP = transformer.config.seq_len;
   ui.statusf("Tokenizer (%u KB)...", (unsigned)(TOKENIZER_DATA_LEN / 1024));
   if (!llm_tokenizer_from_memory(&tokenizer, TOKENIZER_DATA, TOKENIZER_DATA_LEN,
                                  transformer.config.vocab_size)) {
@@ -240,9 +271,11 @@ static void beginGeneration(const std::string& user_text) {
   const bool neo = (tokenizer.style == ARCH_GPTNEO);
   int mode = neo ? settings.mode : M_RAW;
 
-  // Leave room for the reply: everything the prompt doesn't use, the model
-  // can spend on talking back.
-  int budget = KV_SEQ_LEN - (settings.max_reply >= 0 ? settings.max_reply : 0) - 1;
+  // The reply no longer needs reserved window space - once the window fills,
+  // stepGeneration() slides it (pinning the prompt, evicting oldest output).
+  // So the prompt may use almost the whole window; keep a small headroom so the
+  // very first generated tokens don't trigger an immediate slide.
+  int budget = KV_SEQ_LEN - 8;
   if (budget < 8) budget = 8;
 
   if (gen.prompt_tokens) { free(gen.prompt_tokens); gen.prompt_tokens = nullptr; }
@@ -311,46 +344,74 @@ static void beginGeneration(const std::string& user_text) {
   if (gen.n_prompt < 1) { ui.appendBot("[empty]\n"); return; }
   gen.token       = gen.prompt_tokens[0];
   gen.pos         = 0;
+  gen.abspos      = 0;
   gen.next        = 0;
   gen.active      = true;
   gen.t_start_ms  = millis();
   gen.tokens_out  = 0;
   gen.bot_text    = "";
   gen.pending_nl  = false;
-  gen.wrapped     = false;
+  gen.slid        = false;
   ui.beginBotReply();
 }
 
-static void finishReply() {
+// `hit_pos_limit` distinguishes "ran out of position embeddings" (a hard stop
+// mid-sentence) from a normal EOS/length finish, so a truncated reply doesn't
+// read as a sliding artifact.
+static void finishReply(bool hit_pos_limit = false) {
   gen.active = false;
-  bool was_wrapped = gen.wrapped;
+  bool was_slid = gen.slid;
   if (settings.mode == M_CHAT && tokenizer.style == ARCH_GPTNEO && gen.bot_text.length())
     historyPush(gen.user_text, gen.bot_text);
   ui.endBotReply(gen.tokens_out, millis() - gen.t_start_ms);
-  if (was_wrapped) {
-    int total_tok = gen.tokens_out;
-    historyClear();
-    ui.statusf("context wrapped - %d tokens - new convo", total_tok);
-  }
+  if (hit_pos_limit)
+    ui.statusf("%d tokens - context limit reached, /new resets", gen.tokens_out);
+  else if (was_slid)
+    ui.statusf("%d tokens (window slid - earliest context dropped)", gen.tokens_out);
 }
 
 static void stepGeneration() {
-  if (gen.pos >= KV_SEQ_LEN - 1) {
-    if (settings.max_reply == -2) {
-      gen.pos     = gen.n_prompt;  // wrap: overwrite output KV region, keep going
-      gen.wrapped = true;
-    } else {
-      finishReply(); return;
-    }
-  }
   if (settings.max_reply >= 0 && gen.tokens_out >= settings.max_reply) {
     finishReply();
     return;
   }
-  float* logits = llm_forward(&transformer, gen.token, gen.pos);
+  if (gen.abspos >= transformer.config.seq_len - 1) {
+    // The learned position table is exhausted: every further token would reuse
+    // wpe[seq_len-1], so positions stop carrying information and the reply
+    // degenerates. Sliding buys physical room, not new positions - stop here.
+    finishReply(true);
+    return;
+  }
+  if (gen.pos >= KV_SEQ_LEN - 1 && gen.abspos >= gen.n_prompt - 1) {
+    // Context window full (and prefill is done, so `gen.pos` is a write slot,
+    // not a prompt_tokens index). Slide it: keep a short attention-sink prefix,
+    // drop the oldest slots after it, shift the rest down, and keep going.
+    // gen.abspos is NOT rewound - the evicted slots free physical room while
+    // the sequence position keeps advancing.
+    //
+    // How much to pin matters more than it looks. In chat mode the *current*
+    // question sits at the END of the prompt ("<history>\nUser: <q>\nBot:"),
+    // so pinning a large prefix pins the oldest history and drags the eviction
+    // band straight through the question being answered. Capping the pin at a
+    // quarter window puts the band in the stale history instead, while still
+    // pinning a short prompt (story/raw mode) whole so its premise survives.
+    int keep_head = KV_SEQ_LEN / SLIDE_DIV;
+    if (gen.n_prompt < keep_head) keep_head = gen.n_prompt;
+    int evict = KV_SEQ_LEN / SLIDE_DIV;
+    if (evict < 1) evict = 1;
+    evict = llm_kv_slide(&transformer, keep_head, evict);
+    if (evict < 1) { finishReply(); return; }   // cache untouched - don't rewind
+    gen.pos -= evict;            // physical write slot moves back into the freed gap
+    gen.slid = true;
+  }
+  float* logits = llm_forward_at(&transformer, gen.token, gen.pos, gen.abspos);
 
-  if (gen.pos < gen.n_prompt - 1) {
-    gen.next = gen.prompt_tokens[gen.pos + 1];
+  // Prefill is indexed by the ABSOLUTE position: gen.pos rewinds on every slide
+  // and would send us back into prompt replay mid-reply (re-emitting the prompt
+  // tail forever). gen.abspos is monotone, and equals gen.pos until the first
+  // slide - which can only happen once prefill is over.
+  if (gen.abspos < gen.n_prompt - 1) {
+    gen.next = gen.prompt_tokens[gen.abspos + 1];
   } else {
     gen.next = llm_sample(&sampler, logits);
     bool is_eos = (tokenizer.style == ARCH_GPTNEO)
@@ -387,6 +448,7 @@ static void stepGeneration() {
   }
   gen.token = gen.next;
   gen.pos++;
+  gen.abspos++;   // absolute position keeps climbing (clamped to seq_len in forward)
 }
 
 static void setup() {

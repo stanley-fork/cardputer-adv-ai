@@ -7,6 +7,12 @@
 //   /tmp/llm_host embed/model_neo_q4.bin embed/tok_neo.bin "Summary: ...\nStory:" [opts]
 // Options: --max N   --temp F   --top-p F   --seed N   --kv N
 //          --top10 (print top-10 logits per step)
+//          --slide (mirror the firmware's sliding context window)
+//          --sink N (slots pinned across a slide; default = kv/4, as shipped)
+//          --old-policy (pin up to half the window — the eviction policy that
+//                        threw away the current question)
+//          --replay-by-pos (index prefill by KV slot instead of absolute
+//                           position — reproduces the pre-fix replay bug)
 #include "../../main/llm.h"
 #include <cstdio>
 #include <cstdlib>
@@ -33,8 +39,13 @@ int main(int argc, char** argv) {
   int   max_new = 80, kv = 96;
   float temp = 0.0f, top_p = 1.0f;
   unsigned long seed = 1234;
-  bool  top10 = false;
+  bool  top10 = false, slide = false, replay_by_pos = false, old_policy = false;
+  int   sink = 0;      // 0 = mirror the firmware's KV_SEQ_LEN/SLIDE_DIV pin
   for (int i = 4; i < argc; i++) {
+    if (!strcmp(argv[i], "--slide")) { slide = true; continue; }
+    if (!strcmp(argv[i], "--replay-by-pos")) { replay_by_pos = true; continue; }
+    if (!strcmp(argv[i], "--old-policy")) { old_policy = true; continue; }
+    if (!strcmp(argv[i], "--sink")) { sink = atoi(argv[++i]); continue; }
     if (!strcmp(argv[i], "--max"))  max_new = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--temp")) temp = atof(argv[++i]);
     else if (!strcmp(argv[i], "--top-p")) top_p = atof(argv[++i]);
@@ -86,11 +97,61 @@ int main(int argc, char** argv) {
 
   int token = toks[0];
   char scratch[64];
-  for (int pos = 0; pos < kv - 1 && pos < n_prompt - 1 + max_new; pos++) {
-    float* logits = llm_forward(&T, token, pos);
+  int  pos = 0, abspos = 0, tokens_out = 0, n_slides = 0;
+  std::vector<int> slot_abs(kv, -1);   // slot -> absolute position written there
+  // Mirrors main.cpp stepGeneration(). Without --slide the loop stops when the
+  // window fills (the pre-sliding behaviour); with it, the window slides and
+  // `pos` (physical KV slot) decouples from `abspos` (sequence position).
+  for (; tokens_out < max_new; ) {
+    if (abspos >= T.config.seq_len - 1) {
+      fprintf(stderr, "[stop] position table exhausted at abspos=%d\n", abspos);
+      break;
+    }
+    if (pos >= kv - 1) {
+      if (!slide) break;
+      if (abspos < n_prompt - 1) { fprintf(stderr, "[bug] slide during prefill\n"); return 2; }
+      int keep_head = sink > 0 ? sink : kv / 4;
+      if (n_prompt < keep_head) keep_head = n_prompt;
+      int evict = kv / 4;
+      if (old_policy) {                       // pre-fix: pin up to half the window
+        keep_head = n_prompt > kv / 2 ? kv / 2 : n_prompt;
+        evict = (kv - keep_head) / 2;
+      }
+      if (evict < 1) evict = 1;
+      evict = llm_kv_slide(&T, keep_head, evict);
+      if (evict < 1) { fprintf(stderr, "[stop] slide refused\n"); break; }
+      // Mirror the eviction on the slot->abspos shadow map so we can report
+      // which prompt tokens are still resident after the slide.
+      memmove(slot_abs.data() + keep_head, slot_abs.data() + keep_head + evict,
+              (kv - keep_head - evict) * sizeof(int));
+      pos -= evict;
+      n_slides++;
+      std::vector<bool> res(n_prompt, false);
+      for (int i = 0; i < pos; i++)
+        if (slot_abs[i] >= 0 && slot_abs[i] < n_prompt) res[slot_abs[i]] = true;
+      std::string gone;
+      for (int i = 0; i < n_prompt; i++) {
+        if (res[i]) continue;
+        int j = i; while (j + 1 < n_prompt && !res[j + 1]) j++;
+        gone += " " + std::to_string(i) + (j > i ? ".." + std::to_string(j) : "");
+        i = j;
+      }
+      fprintf(stderr, "[slide %d] keep=%d evict=%d -> pos=%d abspos=%d | prompt idx dropped:%s\n",
+              n_slides, keep_head, evict, pos, abspos, gone.empty() ? " none" : gone.c_str());
+      if (replay_by_pos && pos < n_prompt - 1)
+        fprintf(stderr, "[bug] pos rewound into prefill range (pos=%d < n_prompt-1=%d)\n",
+                pos, n_prompt - 1);
+    }
+    float* logits = llm_forward_at(&T, token, pos, abspos);
+    slot_abs[pos] = abspos;
     int next;
-    if (pos < n_prompt - 1) {
-      next = toks[pos + 1];
+    // --replay-by-pos reproduces the pre-fix indexing (physical slot instead of
+    // absolute position), which re-enters prompt replay after a slide.
+    int replay_idx = replay_by_pos ? pos : abspos;
+    if (replay_idx < n_prompt - 1) {
+      if (n_slides > 0)
+        fprintf(stderr, "[bug] re-emitting prompt token idx=%d after slide\n", replay_idx + 1);
+      next = toks[replay_idx + 1];
     } else {
       if (top10) {
         std::vector<int> idx(T.config.vocab_size);
@@ -105,9 +166,13 @@ int main(int argc, char** argv) {
       if (next == K.eos_id || (K.style == ARCH_LLAMA && (next == 1 || next == 2))) break;
       printf("%s", llm_decode(&K, token, next, scratch, sizeof(scratch)));
       fflush(stdout);
+      tokens_out++;
     }
     token = next;
+    pos++;
+    abspos++;
   }
   printf("\n");
+  fprintf(stderr, "[done] tokens_out=%d abspos=%d slides=%d\n", tokens_out, abspos, n_slides);
   return 0;
 }
