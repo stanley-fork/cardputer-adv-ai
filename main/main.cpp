@@ -76,11 +76,10 @@ enum ChatMode { M_CHAT, M_STORY, M_RAW };
 struct Settings {
   float temp      = DEFAULT_TEMP;     // 0.0 = greedy (argmax)
   float top_p     = DEFAULT_TOP_P;    // nucleus mass; 1.0 = off
-  int   max_reply = 44;               // tokens per reply; -1 = run until EOS, sliding the
+  int   max_reply = -1;               // tokens per reply; -1 = run until EOS, sliding the
                                       // context window (still bounded by seq_len positions).
-                                      // Stays a bounded default on purpose - unlimited is
-                                      // opt-in from the settings screen, not the out-of-box
-                                      // behaviour.
+                                      // Settings aren't persisted, so this is what every
+                                      // boot starts at.
   int   mode      = M_CHAT;
 };
 static Settings settings;

@@ -295,9 +295,10 @@ The chat fine-tune is published as **TinyTalk 2**:
   - Generation now stops cleanly when the model's 256 position embeddings run
     out, instead of reusing the last row and degenerating.
   - Reply length is decoupled from the KV window: the setting goes up to 256
-    (was 64) with coarse steps, plus **until eos (slides)** below 4. The
-    default stays bounded — unlimited is opt-in. The old **unsafe** mode is
-    gone; sliding replaces it and doesn't corrupt the cache.
+    (was 64) with coarse steps, plus **until eos (slides)** below 4 — which is
+    now the default, so replies run until the model stops rather than being
+    cut at 44 tokens. The old **unsafe** mode is gone; sliding replaces it and
+    doesn't corrupt the cache.
   - `tools/host/host_test.cpp` mirrors the firmware's generation loop
     (`--slide`, `--sink N`, `--old-policy`, `--replay-by-pos`) and reports
     which prompt tokens each slide drops, so the policy is testable on a host.
