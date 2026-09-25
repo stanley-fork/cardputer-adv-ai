@@ -189,7 +189,9 @@ struct GenState {
                            // climbs even after the window slides pos back down
   int* prompt_tokens = nullptr;
   uint32_t t_start_ms = 0;
+  uint32_t t_gen_ms = 0;   // when prefill ended and the first reply token was sampled
   int tokens_out = 0;
+  int gen_steps = 0;       // sampled forwards, including the one that yields EOS
   std::string user_text;   // chat mode: pending exchange for the history
   std::string bot_text;
   bool pending_nl = false; // hold back a lone "\n" until we know what follows
@@ -347,7 +349,9 @@ static void beginGeneration(const std::string& user_text) {
   gen.next        = 0;
   gen.active      = true;
   gen.t_start_ms  = millis();
+  gen.t_gen_ms    = gen.t_start_ms;
   gen.tokens_out  = 0;
+  gen.gen_steps   = 0;
   gen.bot_text    = "";
   gen.pending_nl  = false;
   gen.slid        = false;
@@ -362,7 +366,12 @@ static void finishReply(bool hit_pos_limit = false) {
   bool was_slid = gen.slid;
   if (settings.mode == M_CHAT && tokenizer.style == ARCH_GPTNEO && gen.bot_text.length())
     historyPush(gen.user_text, gen.bot_text);
-  ui.endBotReply(gen.tokens_out, millis() - gen.t_start_ms);
+  // Speed is reported for generation only: reading the prompt (the whole chat
+  // history, one forward per token) is shown separately, otherwise a short
+  // reply after a long history reads as <1 t/s.
+  uint32_t gen_ms = millis() - gen.t_gen_ms;
+  ui.endBotReply(gen.tokens_out, gen_ms ? gen.gen_steps * 1000.0f / gen_ms : 0.0f,
+                 gen.n_prompt, gen.t_gen_ms - gen.t_start_ms);
   if (hit_pos_limit)
     ui.statusf("%d tokens - context limit reached, /new resets", gen.tokens_out);
   else if (was_slid)
@@ -403,6 +412,7 @@ static void stepGeneration() {
     gen.pos -= evict;            // physical write slot moves back into the freed gap
     gen.slid = true;
   }
+  if (gen.abspos == gen.n_prompt - 1) gen.t_gen_ms = millis();   // prefill done
   float* logits = llm_forward_at(&transformer, gen.token, gen.pos, gen.abspos);
 
   // Prefill is indexed by the ABSOLUTE position: gen.pos rewinds on every slide
@@ -413,6 +423,7 @@ static void stepGeneration() {
     gen.next = gen.prompt_tokens[gen.abspos + 1];
   } else {
     gen.next = llm_sample(&sampler, logits);
+    gen.gen_steps++;
     bool is_eos = (tokenizer.style == ARCH_GPTNEO)
                       ? (gen.next == tokenizer.eos_id)
                       : (gen.next == 1 || gen.next == 2);

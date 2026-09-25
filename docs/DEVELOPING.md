@@ -203,6 +203,8 @@ tools/sim/record.sh            # → docs/media/*.png, demo.gif, demo.mp4, demo-
 `snap`, ...). Seeds were picked by running each scene over 20–30 seeds with
 `--transcript` and keeping a good one; the text itself is never edited.
 
+The promo video lives in `tools/video/` (Remotion); see its README.
+
 ## Memory budget (Cardputer ADV, ~280 KB free heap)
 
 | Buffer (8M model, dim=256)           | Bytes    |

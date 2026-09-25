@@ -385,8 +385,10 @@ void ChatUI::appendUser(const std::string& s) {
 }
 void ChatUI::beginBotReply() { in_bot_ = true; cursor_x_ = MARGIN; }
 void ChatUI::appendBot(const char* piece) { writeText(piece, C_BOT); }
-void ChatUI::endBotReply(int tokens, uint32_t ms) {
+void ChatUI::endBotReply(int tokens, float tok_per_s, int prompt_tokens, uint32_t prompt_ms) {
   newline();
   in_bot_ = false;
-  if (ms > 0) statusf("%d tok / %.1fs (%.2f t/s)", tokens, ms/1000.0f, tokens*1000.0f/ms);
+  // e.g. "9 tok @ 5.10 t/s  (read 42 in 8.2s)" - fits the 40-column status bar
+  if (tok_per_s > 0) statusf("%d tok @ %.2f t/s  (read %d in %.1fs)", tokens,
+                             tok_per_s, prompt_tokens, prompt_ms/1000.0f);
 }

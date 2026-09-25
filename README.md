@@ -79,7 +79,6 @@ It can tell stories too. Switch to story mode, type *"a brave little cat who sav
   <img src="docs/media/screen-01-chat.png" width="32%" alt="small talk">
   <img src="docs/media/screen-03-facts.png" width="32%" alt="simple facts and I don't know">
   <img src="docs/media/screen-05-story.png" width="32%" alt="story mode">
-  <br><sub>The speed in the top bar also counts the time spent re-reading the conversation before each answer.</sub>
 </p>
 
 ## 🧸 What it's good at (and what it's not)
@@ -149,6 +148,15 @@ Writing about Cardputer AI? Use anything here. No need to ask. A credit line and
 <details>
 <summary><b>📜 Changelog</b></summary>
 
+- **v2.2** — honest speed readout + press kit
+  - The status bar after a reply now shows generation speed and prompt
+    reading separately: `9 tok @ 5.10 t/s  (read 61 in 11.8s)`. It used to
+    divide the reply's tokens by the whole wait, including re-reading the
+    chat history (one forward per prompt token), which showed e.g. 0.66 t/s.
+  - Landing-page README with a demo video, screenshots and a press kit
+    (`docs/media`); build and training notes moved to `docs/DEVELOPING.md`.
+  - `tools/sim`: host screen simulator that runs the real firmware UI + model
+    at device speed and regenerates all media; `tools/video`: Remotion promo.
 - **v2.1** — sliding context window
   - **Replies no longer stop at the KV window.** When the cache fills mid-reply
     the window slides: a quarter-window prefix stays pinned as an attention

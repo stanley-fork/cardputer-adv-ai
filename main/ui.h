@@ -26,7 +26,7 @@ public:
   void appendUser(const std::string& s);
   void beginBotReply();
   void appendBot(const char* piece);
-  void endBotReply(int tokens, uint32_t ms);
+  void endBotReply(int tokens, float tok_per_s, int prompt_tokens, uint32_t prompt_ms);
   void tickGenerating(int tokens);   // call each loop() while generating
   void scrollChat(int lines);        // >0 scrolls up (older), <0 down
 
