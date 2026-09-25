@@ -1,0 +1,59 @@
+# Cardputer AI demo reel. Seeds were picked from sweeps of 20-30 seeds per
+# scene (tools/sim/sweep.sh); every word the bot says is real model output.
+wait 300
+snap 00-ready
+# --- small talk ---
+seed 23
+type Hi! How are you?
+enter
+wait 1200
+type I just got a new puppy!
+enter
+wait 1200
+type He is small and brown.
+snapgen 01-chat-live 6
+enter
+wait 2000
+snap 01-chat
+type /new
+enter
+wait 800
+# --- feelings ---
+seed 20
+type I feel a bit sad today.
+enter
+wait 1200
+type My friend moved away.
+enter
+wait 2000
+snap 02-feelings
+type /new
+enter
+wait 800
+# --- kindergarten facts, and knowing its limits ---
+seed 2
+type What color is the sky?
+enter
+wait 1000
+type What does a cow say?
+enter
+wait 1000
+type How far away is the moon?
+enter
+wait 2000
+snap 03-facts
+# --- story mode ---
+tab
+wait 900
+key /
+wait 1200
+snap 04-settings
+tab
+wait 600
+seed 7
+type a brave little cat who saves her friend
+snapgen 05-story-live 40
+enter
+wait 2500
+snap 05-story
+wait 1000

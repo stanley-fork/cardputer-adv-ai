@@ -1,282 +1,151 @@
-# Cardputer AI — a tiny local chatbot for the ESP32 Cardputer ADV
+<p align="center">
+  <img src="docs/media/demo.gif" width="460" alt="Cardputer AI chatting on a tiny screen: small talk, feelings, simple facts, and a story">
+</p>
 
-A fully local, offline chatbot running on the **M5Stack Cardputer ADV**
-(ESP32-S3FN8, 512 KB SRAM, 8 MB flash, no PSRAM). It also runs on the
-**original M5Stack Cardputer** — the firmware ships both keyboard drivers
-(the ADV's TCA8418 and the original's IO matrix) and picks the right one at
-boot. No Wi-Fi, no API, no SD card — the LLM lives in the firmware and runs
-on the microcontroller itself. It makes small talk with multi-turn memory
-and writes stories on request, at ~7 tok/s.
+<h1 align="center">Cardputer AI</h1>
 
-The model is [roneneldan/TinyStories-Instruct-3M][hf-neo] (GPT-Neo) fine-tuned
-on simple-English dialogues (filtered [allenai/SODA][soda] +
-[DailyDialog][dd], formatted `User: ...\nBot: ...<|endoftext|>`, loss masked
-to bot replies) mixed with 30% story data so the story skill survives, plus
-two small hand-templated skills: kindergarten Q&A it *can* answer (colors,
-animal sounds, opposites — `tools/qa_facts.py`) and graceful "I don't know"
-replies for questions beyond a 3M-param model (paired with [SciQ][sciq]
-questions). The fine-tune runs in about an hour on an Apple-Silicon Mac via
-`tools/finetune_chat.py`.
+<p align="center">
+  <b>A real chatbot that lives on a microchip.</b><br>
+  No internet. No cloud. No phone. Just a tiny chip with 512 KB of RAM, and it talks back.
+</p>
 
-[soda]: https://huggingface.co/datasets/allenai/soda
-[dd]: https://huggingface.co/datasets/li2017dailydialog/daily_dialog
-[sciq]: https://huggingface.co/datasets/allenai/sciq
+<p align="center">
+  <a href="https://github.com/therezor/cardputer-ai/releases/latest"><b>⬇️ Download firmware</b></a> ·
+  <a href="docs/media/demo.mp4"><b>▶️ Watch the demo (1080p)</b></a> ·
+  <a href="https://huggingface.co/TheREZOR/TinyTalk-2"><b>🤗 Get the model</b></a> ·
+  <a href="#-press-kit"><b>📰 Press kit</b></a>
+</p>
 
-The engine also still runs the original [Maykeye/TinyLLama-v0][hf-llama]
-completion model — the embedded model's header selects the architecture
-(LLaMA vs GPT-Neo) at boot. Swap models by re-running the matching converter.
+---
 
-Weights are quantized to **Q4_0** and embedded into the firmware binary, so
-flashing through [bmorcelli/Launcher][lc] installs everything in one step —
-no SD card, no model partition flashing, no setup.
+## 🤯 Why this is a big deal
 
-[hf-neo]: https://huggingface.co/roneneldan/TinyStories-Instruct-3M
-[hf-llama]: https://huggingface.co/Maykeye/TinyLLama-v0
-[lc]: https://github.com/bmorcelli/Launcher
+Chatbots like ChatGPT run on giant data centers full of GPUs.
 
-## Modes
+**Cardputer AI runs on a chip that costs a few dollars.** The whole thing (the brain, the words it knows, the chat) fits inside a pocket computer the size of a credit card. Unplug the Wi-Fi. It still works.
 
-- **chat** (default): turn-taking small talk. The firmware rebuilds the
-  training format every turn — recent exchanges joined by EOS tokens — and
-  trims the oldest exchanges to fit the prompt budget. `/new` resets the
-  conversation. Replies end when the model emits EOS (it learned to stop).
-- **story**: wraps your text as `Summary: <text>\nStory:` — type what the
-  story should be about, get that story.
-- **raw**: plain completion, no wrapper (works with the old LLaMA model too).
+Tiny AI on microchips has been done before. But those models could only **continue a story**: you type *"Once upon a time"* and they keep going. Ask them a question and you get more story.
 
-Honest limits: kindergarten English and an 80-token context (~3 short
-exchanges of memory). It can answer kindergarten facts it was trained on
-(colors, animal sounds, opposites) and is trained to say "I don't know" to
-questions beyond it, instead of confabulating — mostly. It's still a
-3M-param model; expect charming nonsense at the edges.
+This one **chats**. You say something, it answers. It stays on topic. It asks you questions back. It says *"I don't know"* when it doesn't know.
 
-## Fine-tune pipeline (rebuild the chat model from scratch)
+> **To our knowledge, this is the first chatbot that holds a coherent English conversation while running entirely on a microcontroller this small.** That means 512 KB of RAM, no extra memory chips, and no internet.
 
-```sh
-../cardputer_ai_venv/bin/python tools/prepare_chat_data.py       # ~15 min
-../cardputer_ai_venv/bin/python tools/finetune_chat.py --epochs 2 \
-    --warmup 400 --out-dir data/chat_model_v2                    # ~1 h MPS
-../cardputer_ai_venv/bin/python tools/convert_tinystories_instruct.py \
-    --model-dir data/chat_model_v2 --corpus data/chat_train.txt \
-    --min-count 8 --keep-bin
+In 2023, the TinyStories paper asked: *"How small can language models be and still speak coherent English?"*
+Our answer: **small enough to fit on a microchip, and still hold a chat.**
+
+## 📊 By the numbers
+
+| | Cardputer AI |
+|---|---|
+| 🧠 **Brain size** | 8 million parameters. That's ~50,000× smaller than Llama 3.1 405B |
+| 💾 **Memory** | 512 KB of RAM, less than one photo on your phone |
+| 📦 **Model file** | 5.7 MB, baked right into the firmware |
+| ⚡ **Speed** | ~5 tokens (word pieces) per second |
+| 📡 **Internet** | Not needed. Ever. |
+| 🔋 **Power** | Runs on the Cardputer's battery |
+
+## 💬 See it talk
+
+A real conversation, word for word, from the [demo video](docs/media/demo.mp4):
+
+```text
+> Hi! How are you?
+  Hey! I'm good, thanks for asking. How about you?
+> I just got a new puppy!
+  Oh, really? What kind is it?
+> He is small and brown.
+  That's nice. Can I pet him?
+
+> I feel a bit sad today.
+  Why are you sad?
+> My friend moved away.
+  Oh, that's terrible. Do you want to talk about it?
+
+> What color is the sky?
+  The sky is blue.
+> What does a cow say?
+  A cow says moo!
+> How far away is the moon?
+  I am too little to know that.
 ```
 
-The data prep keeps the longest *window* of simple turns per SODA dialogue
-(not just the prefix) and renames speakers to TinyStories-frequent names —
-together those roughly double the usable-dialogue yield vs the old prefix
-filter. Loss is masked to bot replies and story bodies (the model never
-trains on producing user turns), and chat samples are tokenized
-segment-by-segment in exactly the shapes the firmware feeds at inference.
+It can tell stories too. Switch to story mode, type *"a brave little cat who saves her friend"*, and you get:
 
-To compare a new fine-tune against the previous one before flashing:
+> *Once upon a time, there was a brave little cat. She lived in a big tree with her friends. One day, she saw a bird in the sky. The bird was scared. The cat wanted to help the bird. The brave cat climbed the tree. She saved her friend. The bird was happy. The cat and her friends played and laughed. They were happy that the brave cat saved her friend.*
 
-```sh
-# masked val loss on the frozen val set (predates the current corpus)
-../cardputer_ai_venv/bin/python tools/eval_chat.py \
-    --model-dir data/chat_model_masked --model-dir data/chat_model_v2
-# fixed prompt battery through the host harness (facts / IDK / over-refusal)
-../cardputer_ai_venv/bin/python tools/eval_battery.py \
-    --model old=path/to/old/model_neo_q4.bin,path/to/old/tok_neo.bin \
-    --model new=embed/model_neo_q4.bin,embed/tok_neo.bin
-```
+<p align="center">
+  <img src="docs/media/screen-01-chat.png" width="32%" alt="small talk">
+  <img src="docs/media/screen-03-facts.png" width="32%" alt="simple facts and I don't know">
+  <img src="docs/media/screen-05-story.png" width="32%" alt="story mode">
+  <br><sub>The speed in the top bar also counts the time spent re-reading the conversation before each answer.</sub>
+</p>
 
-NOTE: keep the venv (and anything containing PyTorch) outside the repo so
-build tooling never walks into torch's headers.
+## 🧸 What it's good at (and what it's not)
 
-## What's in the box
+Think of it as a friendly **4-year-old** that lives in your pocket.
 
-```
-cardputer_ai/
-├── platformio.ini             PlatformIO build (espidf framework, IDF 5.5)
-├── CMakeLists.txt             plain ESP-IDF build (`idf.py build`) works too
-├── sdkconfig.defaults         flash/CPU/WDT config for the Cardputer ADV
-├── partitions.csv             6 MB factory app slot for app + embedded model
-├── main/                      the ESP-IDF "main" component
-│   ├── main.cpp               boot + chat loop + story-mode prompt wrapper
-│   ├── llm.{h,cpp}            Q4_0 engine: LLaMA + GPT-Neo forward paths,
-│   │                          dual-core matmul, exact byte-level BPE
-│   ├── ui.{h,cpp}             chat UI
-│   ├── keyboard/              Cardputer keyboard driver, ported to ESP-IDF
-│   │                          from m5stack/M5Cardputer v1.1.1 (MIT)
-│   ├── model_data.cpp         generated — Q4 model bytes (~1.9 MB for 3M)
-│   └── tok_data.cpp           generated — pruned GPT-2 tokenizer (~190 KB)
-└── tools/
-    ├── prepare_chat_data.py              SODA/DailyDialog/QA/IDK → corpus
-    ├── qa_facts.py                       hand-written kindergarten Q&A + deflections
-    ├── finetune_chat.py                  masked-loss fine-tune (MPS/CPU)
-    ├── eval_chat.py                      masked val loss, old vs new checkpoint
-    ├── eval_battery.py / eval_prompts.txt  fixed prompt battery, scored
-    ├── convert_tinystories_instruct.py   HF GPT-Neo → Q4_0 + pruned vocab
-    ├── convert_tinyllama_v0.py           the old TinyLLama-v0 converter
-    └── host/                             macOS/Linux test harness for llm.cpp
-```
+| 👍 Good at | 👎 Not good at |
+|---|---|
+| Small talk: "how are you?", pets, feelings | Facts about the real world |
+| Simple facts: colors, animal sounds, opposites | Math, homework, coding |
+| Saying *"I don't know"* instead of making things up (mostly) | Remembering more than ~3 messages |
+| Short bedtime stories | Long, deep conversations |
 
-The display (and board autodetect, power, etc.) comes from the
-`m5stack/m5unified` + `m5stack/m5gfx` managed components, resolved from the
-ESP Component Registry on first build (`main/idf_component.yml`).
+It's 8 million parameters. Expect charming nonsense at the edges. That's part of the fun.
 
-## One-time setup
+## 🚀 Try it in 3 steps
 
-```sh
-python3 -m venv ../cardputer_ai_venv   # keep the venv outside the repo
-../cardputer_ai_venv/bin/pip install huggingface_hub tokenizers torch numpy datasets transformers
-../cardputer_ai_venv/bin/python tools/convert_tinystories_instruct.py            # base 3M model
-../cardputer_ai_venv/bin/python tools/convert_tinystories_instruct.py --model 8M # bigger, ~5MB
-```
+1. **Get a Cardputer.** An [M5Stack Cardputer ADV](https://docs.m5stack.com/en/core/Cardputer-Adv) or the original Cardputer. The same firmware runs on both.
+2. **Flash it.** Grab `cardputer_ai_<version>.bin` from [Releases](https://github.com/therezor/cardputer-ai/releases/latest) and install it with [M5Launcher](https://github.com/bmorcelli/Launcher). Or build it yourself: `pio run -t upload`.
+3. **Type and press Enter.** That's it. No setup, no account, no SD card.
 
-The converter downloads the model, prunes the 50,257-token GPT-2 vocab to the
-~12K tokens the TinyStories dataset actually uses (closed under BPE merge
-derivation, so encoding stays exact), quantizes to Q4_0, and writes
-**`main/model_data.cpp`** / **`main/tok_data.cpp`**.
+| Key | What it does |
+|---|---|
+| `Enter` | send your message |
+| `/new` + `Enter` | start a fresh conversation |
+| `Tab` | settings: chat / story mode, creativity (temperature), reply length |
+| `` ` `` | stop a reply mid-sentence |
+| `Fn` + `;` / `.` | scroll up / down through the chat |
 
-Why prune? The full GPT-2 embedding table would be 13M params — bigger than
-the 3M transformer itself — and a 50K-logit buffer (196 KB) doesn't fit our
-heap. Pruned: ~1.9 MB total model, ~50 KB logits.
+No Cardputer? The model runs on your computer too: `ollama run hf.co/TheREZOR/TinyTalk-2-GGUF`
 
-## Build & flash
+## 🔧 How does it fit?
 
-PlatformIO (the `espidf` framework via the [pioarduino] platform, which ships
-ESP-IDF v5.5 — the official `espressif32` platform stopped at 5.4):
+The short version:
 
-```sh
-pio run                # build → .pio/build/cardputer/firmware.bin
-pio run -t upload      # flash over USB
-pio device monitor     # serial logs
-```
+1. **Start tiny.** The base is TinyStories-Instruct-8M, a model trained only on simple kids' stories. Simple words means a small brain can still speak clearly.
+2. **Teach it to chat.** We fine-tuned it on thousands of everyday dialogues, so it answers you instead of writing a story.
+3. **Squeeze hard.** Weights shrink to 4 bits each. The vocabulary shrinks from 50,000 words to 13,000. The chat memory is 4-bit too.
+4. **Go fast.** The model is read straight from flash storage, and hand-written vector (SIMD) code on the ESP32-S3 does the math.
 
-One image covers both the original Cardputer and the ADV: they share the
-M5Stamp-S3 module, the keyboard driver is chosen at runtime from
-`M5.getBoard()`, and M5Unified autodetects the display. Flash the same
-`firmware.bin` to either board.
+The long version, with every build, training and hacking detail, is in **[docs/DEVELOPING.md](docs/DEVELOPING.md)**.
 
-The same tree is a standard ESP-IDF project, so this works too:
+## 📰 Press kit
 
-```sh
-idf.py build flash monitor
-```
+Writing about Cardputer AI? Use anything here. No need to ask. A credit line and a link to this repo are appreciated.
 
-Settings that used to be Arduino IDE menu choices (8 MB flash, DIO/80 MHz, no
-PSRAM, custom partition table, 240 MHz CPU) live in `sdkconfig.defaults`.
+**One-line summary:** *Cardputer AI is an open-source chatbot that runs entirely on a few-dollar ESP32-S3 microcontroller with 512 KB of RAM. It needs no internet, holds a simple English conversation, and generates about 5 tokens per second.*
 
-For [bmorcelli/Launcher][lc] installs, ship
-`.pio/build/cardputer/firmware.bin` — the partition table in this repo
-keeps the factory app at offset 0x10000, which is where Launcher writes it.
-(`firmware.factory.bin` in the same directory is the full-flash image:
-bootloader + partition table + app, for esptool at offset 0x0.)
+| Asset | Preview |
+|---|---|
+| **Demo video**: full demo at real speed, 1080p MP4 (2 min) · [download](docs/media/demo.mp4) | [<img src="docs/media/screen-01-chat-live.png" width="240">](docs/media/demo.mp4) |
+| **Demo GIF**: same demo in a device frame · [download](docs/media/demo.gif) | <img src="docs/media/device-chat.png" width="240"> |
+| **Social banner**: 1280×640 · [download](docs/media/banner.png) | <img src="docs/media/banner.png" width="240"> |
+| **Device frame stills** · [chat](docs/media/device-chat.png) · [story](docs/media/device-story.png) | <img src="docs/media/device-story.png" width="240"> |
+| **Screenshots**: 1920×1080, pixel-exact · [small talk](docs/media/screen-01-chat.png) · [feelings](docs/media/screen-02-feelings.png) · [facts](docs/media/screen-03-facts.png) · [settings](docs/media/screen-04-settings.png) · [story](docs/media/screen-05-story.png) | <img src="docs/media/screen-02-feelings.png" width="240"> |
+| **Full transcript** of the demo · [text](docs/media/demo-transcript.txt) | |
 
-**Upgrading from a pre-8M build**: the partition table changed (the unused
-SPIFFS partition was removed to make room for the 8M model) and the flash
-mode changed DIO→QIO. The flash mode lives in the *bootloader* header, which
-Launcher does not rewrite — so for full speed, flash the complete image once
-over USB:
+**Key facts:**
+- Model: **TinyTalk 2**, 8M parameters, fine-tuned from TinyStories-Instruct-8M for chat. Open weights on [Hugging Face](https://huggingface.co/TheREZOR/TinyTalk-2).
+- Hardware: M5Stack Cardputer / Cardputer ADV. ESP32-S3 chip, 512 KB SRAM, 8 MB flash, **no PSRAM**.
+- Speed: ~5 tokens/second (196 ms per token, measured on device).
+- Fully offline. The model is part of the firmware.
+- Open source (MIT code). Made by **REZOR** ([@therezor](https://github.com/therezor)).
 
-```sh
-pio run -t upload   # or: esptool.py write_flash 0x0 firmware.factory.bin
-```
+**How the media was made:** the screens come from the firmware's own UI and chat code, run in a [pixel-exact simulator](docs/DEVELOPING.md#screen-simulator-readme--press-media) with the real embedded model. Every step is timed at the measured on-device speed. The bot's words are unedited model output. We picked the best random seed per scene, just like picking the best take. The device frame is an illustration, not a photo.
 
-If boot logs show ~13 MB/s flash bandwidth instead of ~25, the bootloader is
-still DIO.
-
-[pioarduino]: https://github.com/pioarduino/platform-espressif32
-
-## Host testing (no hardware needed)
-
-`tools/host/` stubs the ESP32 APIs so the exact engine code runs on your Mac:
-
-```sh
-../cardputer_ai_venv/bin/python tools/convert_tinystories_instruct.py --keep-bin --no-cpp
-clang++ -std=c++17 -O2 -I tools/host tools/host/host_test.cpp main/llm.cpp -o /tmp/llm_host
-/tmp/llm_host embed/model_neo_q4.bin embed/tok_neo.bin \
-  "Summary: a girl finds a lost cat.\nStory:" --temp 0.8 --top-p 0.9 --kv 80
-```
-
-## Memory budget (Cardputer ADV, ~280 KB free heap)
-
-| Buffer (8M model, dim=256)           | Bytes    |
-|--------------------------------------|----------|
-| KV cache, ctx=72, int4 + group scales| ~166 KB  |
-| Logits (vocab=12929)                 | ~50 KB   |
-| Activations + attention scores       | ~19 KB   |
-| FreeRTOS + matmul worker stack       | 5 KB     |
-
-(The 3M model at dim=128 uses an 80-token window and only ~90 KB of KV.)
-The KV window is picked from the model header at boot (`kvLenForModel` in
-`main/main.cpp`). The converter enforces `--max-vocab` (default 15,500) so
-a corpus change can't silently blow the logits budget.
-
-The GPT-Neo KV cache is stored as **int8 with one fp32 scale per row** (the
-LLaMA path keeps bf16) — at dim=128 that's 2 KB/position, which is what makes
-an 80-token window fit. `KV_SEQ_LEN` lives in `main/main.cpp`; the model
-ships 256 position embeddings, so RAM is the binding constraint, not flash.
-
-## Engine notes
-
-- GPT-Neo forward path: LayerNorm (+bias), learned position embeddings,
-  GELU MLP, and — faithful to the original — **no 1/sqrt(d) attention
-  scaling**. The alternating "local attention" layers have a 256-token
-  window ≥ our context, so they degenerate to global causal attention.
-- **ESP32-S3 PIE SIMD matmul** (`main/dot_q4_pie.S`): activations are
-  quantized to int8 once per matmul (llama.cpp's Q4_0×Q8_0 scheme), then
-  each 32-weight block is 2× `EE.VMULAS.S8.ACCX` — 16 int8 MACs per
-  instruction. The CRDP v3 blob stores weights row-planar
-  ([bf16 scales | pad | 16-byte nibble groups]) so every vector load is
-  16-byte aligned. A boot-time selftest compares the SIMD kernel against
-  the scalar reference on real weight rows and refuses to run on mismatch.
-  Host builds (and `-DLLM_FORCE_SCALAR`) use the scalar path.
-- **KV cache is int4** (nibbles + one bf16 scale per 32-element group,
-  Q4_0-style asymmetric). Each head lies inside one scale group, so
-  attention applies a single scale per (head, position). Measured on the
-  eval battery this matches int8-KV quality — and it's what fits the 8M
-  model's 72-token window in SRAM.
-- Weights stream from MMU-mapped flash every token, so **flash bandwidth is
-  the throughput ceiling** for the 8M model — the build uses QIO + 64-byte
-  cache lines, and boot logs the measured flash bandwidth over serial.
-- Tokenizer is **exact** GPT-2 byte-level BPE: the blob embeds the merge
-  pair table (binary-searched from flash); verified 0 mismatches vs
-  HuggingFace on 500 dataset lines.
-- Q4 logits match the fp32 HF reference closely (top-3 identical on test
-  prompts); divergence in long greedy decodes is normal quantization noise.
-- Sampler: greedy at T=0; otherwise softmax + **top-p (nucleus)** sampling
-  over the 64 most likely tokens (single pass, no full-vocab sort — a
-  min-tracked candidate array costs ~1 compare per vocab entry). Top-p 1.0
-  falls back to the exact full-vocab multinomial. Temperature and top-p are
-  live in the settings screen.
-
-## What's not great yet
-
-- 80 tokens of context ≈ 3 short exchanges of conversational memory; older
-  turns silently fall out of the prompt. Within a single reply the window
-  now *slides* rather than stopping, so replies can run past it — but
-  sliding evicts old context to make room, so a long reply trades memory
-  for length.
-- Reply length tops out around 250 tokens of *useful* output. That is the
-  model, not the firmware: TinyStories-Instruct-8M was fine-tuned at
-  `--seq-len 256`, and generating past that (even in PyTorch with full
-  attention and no sliding window) degenerates into looping `Summary:`
-  fragments. The converter's 256 position embeddings sit right at that
-  limit deliberately — exporting more buys tokens the model can't use.
-- Only kindergarten facts. Everything else gets a (trained) "I don't know" —
-  for real factual Q&A you'd need Wi-Fi + an API, or different hardware.
-- ~5 tok/s measured on device for the 8M model (196 ms/token; PIE SIMD +
-  QIO + 64-byte cache lines). The ceiling is flash streaming (~30 MB/s,
-  ~5.6 MB read per token); the next levers are a harder vocab prune, 120 MHz
-  flash (experimental HPM), or batched/speculative decoding.
-- Chat quality is bounded by 8M params — noticeably better grammar and
-  context-tracking than 3M, still no real-world knowledge.
-
-## Get the model (without a Cardputer)
-
-The chat fine-tune is published as **TinyTalk 2**:
-
-- [TheREZOR/TinyTalk-2](https://huggingface.co/TheREZOR/TinyTalk-2) —
-  safetensors (transformers, GPT-Neo), with embedded chat template
-- [TheREZOR/TinyTalk-2-GGUF](https://huggingface.co/TheREZOR/TinyTalk-2-GGUF) —
-  GGUF for llama.cpp / Ollama: `ollama run hf.co/TheREZOR/TinyTalk-2-GGUF`
-  (GGUF uses a mathematically-exact GPT-2 conversion, `tools/export_gpt2.py`,
-  since llama.cpp doesn't support plain GPT-Neo)
-- [TheREZOR/TinyTalk](https://huggingface.co/TheREZOR/TinyTalk) — v1 (3M)
-
-## Changelog
+<details>
+<summary><b>📜 Changelog</b></summary>
 
 - **v2.1** — sliding context window
   - **Replies no longer stop at the KV window.** When the cache fills mid-reply
@@ -334,9 +203,11 @@ The chat fine-tune is published as **TinyTalk 2**:
     keep going by reusing memory, clearing the chat when it runs out).
 - **v1.0** — initial release.
 
-## License
+</details>
 
-Code: MIT (see LICENSE). The embedded model derives from
-TinyStories-Instruct-3M and the SODA (CC BY 4.0), DailyDialog
-(CC BY-NC-SA 4.0) and SciQ (CC BY-NC 3.0) datasets — the latter two are
-**non-commercial**; see NOTICE.md for full third-party attributions.
+## 📄 License
+
+Code: MIT (see [LICENSE](LICENSE)). The embedded model derives from
+TinyStories-Instruct and the SODA (CC BY 4.0), DailyDialog
+(CC BY-NC-SA 4.0) and SciQ (CC BY-NC 3.0) datasets. The latter two are
+**non-commercial**; see [NOTICE.md](NOTICE.md) for full third-party attributions.
