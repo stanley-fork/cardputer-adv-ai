@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/media/demo.gif" width="460" alt="Cardputer AI chatting on a tiny screen: small talk, feelings, simple facts, and a story">
+  <img src="docs/media/demo.gif" width="600" alt="Cardputer AI chatting on a tiny screen: small talk, feelings, simple facts, and a story">
 </p>
 
 <h1 align="center">Cardputer AI</h1>
