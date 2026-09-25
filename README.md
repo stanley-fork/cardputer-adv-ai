@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/therezor/cardputer-ai/releases/latest"><b>⬇️ Download firmware</b></a> ·
-  <a href="docs/media/demo.mp4"><b>▶️ Watch the demo (1080p)</b></a> ·
+  <a href="#-see-it-talk"><b>▶️ Watch the demo</b></a> ·
   <a href="https://huggingface.co/TheREZOR/TinyTalk-2"><b>🤗 Get the model</b></a> ·
   <a href="#-press-kit"><b>📰 Press kit</b></a>
 </p>
@@ -46,7 +46,9 @@ Our answer: **small enough to fit on a microchip, and still hold a chat.**
 
 ## 💬 See it talk
 
-A real conversation, word for word, from the [demo video](docs/media/demo.mp4):
+https://github.com/user-attachments/assets/a317cf9a-c57c-4c1f-9263-bc137870fa17
+
+A real conversation, word for word, from the demo video above:
 
 ```text
 > Hi! How are you?
