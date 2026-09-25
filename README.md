@@ -11,12 +11,16 @@
 
 <p align="center">
   <a href="https://github.com/therezor/cardputer-ai/releases/latest"><b>⬇️ Download firmware</b></a> ·
-  <a href="#-see-it-talk"><b>▶️ Watch the demo</b></a> ·
+  <a href="#-watch-the-promo"><b>▶️ Watch the promo</b></a> ·
   <a href="https://huggingface.co/TheREZOR/TinyTalk-2"><b>🤗 Get the model</b></a> ·
   <a href="#-press-kit"><b>📰 Press kit</b></a>
 </p>
 
 ---
+
+## 🎬 Watch the promo
+
+https://github.com/user-attachments/assets/4f42d833-51dd-4b7c-823d-9e9852355083
 
 ## 🤯 Why this is a big deal
 
@@ -46,7 +50,7 @@ Our answer: **small enough to fit on a microchip, and still hold a chat.**
 
 ## 💬 See it talk
 
-https://github.com/user-attachments/assets/a317cf9a-c57c-4c1f-9263-bc137870fa17
+https://github.com/user-attachments/assets/c9977f6f-6a45-461b-82ca-8b01988d8508
 
 A real conversation, word for word, from the demo video above:
 
@@ -129,6 +133,7 @@ Writing about Cardputer AI? Use anything here. No need to ask. A credit line and
 
 | Asset | Preview |
 |---|---|
+| **Promo video**: 75-second trailer, 1080p MP4 with music · [download](https://github.com/therezor/cardputer-ai/releases/download/2.2/cardputer-ai-promo.mp4) | |
 | **Demo video**: full demo at real speed, 1080p MP4 (2 min) · [download](docs/media/demo.mp4) | [<img src="docs/media/screen-01-chat-live.png" width="240">](docs/media/demo.mp4) |
 | **Demo GIF**: same demo in a device frame · [download](docs/media/demo.gif) | <img src="docs/media/device-chat.png" width="240"> |
 | **Social banner**: 1280×640 · [download](docs/media/banner.png) | <img src="docs/media/banner.png" width="240"> |
